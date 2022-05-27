@@ -1,0 +1,2124 @@
+### Confirmatory data analysis code of the AMP-TPP2 project at preregistration
+
+#############################################################
+#                                                           #
+#                        Packages                           #
+#                                                           #
+#############################################################
+
+library(lme4) # for glmer()
+library(tidyverse)
+
+
+#############################################################
+#                                                           #
+#                   Custom functions                        #
+#                                                           #
+#############################################################
+
+
+### Functions for Bayes factor caclulation using beta prior
+# These functions are required to run the Bayes factor analysis
+# The custom code is necessary because we use beta priors, and 
+# the BayesFactor package by default does not have built in beta priors
+# We thank Richard Morey for his help in developing these functions!
+
+
+fullAlt_beta = Vectorize(function(p, y, N, alpha, beta){
+  exp(dbinom(y, N, p, log = TRUE) + dbeta(p, alpha, beta, log = TRUE)) 
+},"p")
+
+normalize_beta = function(alpha, beta, interval){
+  diff(pbeta(interval, alpha, beta))
+}
+
+restrictedAlt_beta = function(p,y,N,y_prior,N_prior,interval){
+  alpha = y_prior + 1
+  beta = N_prior - y_prior + 1
+  fullAlt_beta(p, y, N, alpha, beta) / normalize_beta(alpha, beta, interval) * (p>interval[1] & p<interval[2])
+}
+
+margLike_beta = function(y, N, y_prior, N_prior, interval){
+  integrate(restrictedAlt_beta, interval[1], interval[2], 
+            y = y, N = N, y_prior = y_prior, N_prior = N_prior, interval = interval)[[1]]
+}
+
+BF01_beta = Vectorize(function(y, N, y_prior, N_prior, interval, null_prob){
+  dbinom(y, N, null_prob) / margLike_beta(y = y, N = N, y_prior = y_prior, N_prior = N_prior, interval = interval)
+},"y")
+
+
+### Function calculating the highest density interval using sampling
+# We use hdi() from the library(HDInterval)
+# this function is needed for the Bayesian parameter estimation robustness test
+
+mode_HDI <- function(scale, density, crit_width = 0.95, n_samples = 1e5){
+  samp <- sample(x = scale, size = n_samples, replace = TRUE, prob = density)
+  hdi_result = hdi(samp, credMass=crit_width)
+  result = c(scale[which(density == max(density))], # mode
+             hdi_result[1], # lower bound
+             hdi_result[2]) # upper bound
+  
+  # only needed for the names of the result
+  Crit_lb = (1-crit_width)/2
+  Crit_ub = crit_width + (1-crit_width)/2
+  
+  names(result) = c("mode", paste(Crit_lb*100, "%", sep = ""), paste(Crit_ub*100, "%", sep = ""))
+  return(result)
+}
+
+
+# rule for hypothesis testing inference for Bayesian proportion tests
+BF_inference_function = function(BF){
+  if(Inference_threshold_BF_low >= BF) {return("M1")
+  } else if(Inference_threshold_BF_high <= BF) {return("M0")
+  } else {return("Inconclusive")}
+}
+
+
+### to convert logit to probability
+### this is used for conversion of the results of the
+### logistic regression to the probability scale
+
+logit2prob <- function(logit){
+  odds <- exp(logit)
+  prob <- odds / (1 + odds)
+  return(prob)
+}
+
+
+#############################################################
+#                                                           #
+#                Load and manage data                       #
+#                                                           #
+#############################################################
+
+#############################################################
+#                                                           #
+#                Load and manage data                       #
+#                                                           #
+#############################################################
+
+
+### You need to download all .csv files from the project's GitHub repository into a local folder
+### https://github.com/amp2-tpp/transparent-psi-results/tree/master/live_data
+### blow you need to specify the path to this folder.
+
+data_folder <- "C:\\Users\\User\\Documents\\Temp\\AMP-TPP-2-3-data_final\\" # change to data folder path
+
+data_file_list <- list.files(data_folder)
+
+list_of__s = lapply(strsplit(data_file_list, ''), function(x) which(x == '_'))
+list_of__s_post = sapply(list_of__s, function(x) tail(x, n=1))
+length_of_linknames = lapply(data_file_list, nchar)
+start_dates = substr(data_file_list, list_of__s_post+1, unlist(length_of_linknames)-4)
+data_file_list_ordered_pre = data_file_list[order(as.Date(start_dates, format = "%d-%m-%Y"))]
+
+data_file_list_ordered_fullpath <- paste0(data_folder, data_file_list_ordered_pre)
+
+raw_data_pre_list <- list(NA)
+
+for(i in 1:length(data_file_list_ordered_fullpath)){
+  raw_data_pre_list[[i]] <- read.csv(data_file_list_ordered_fullpath[i])
+}
+
+raw_data <- do.call("rbind", raw_data_pre_list)
+
+
+raw_data[,"sides_match"] = as.factor(tolower(as.logical(raw_data[,"sides_match"])))
+raw_data[,"participant_ID"] = as.factor(raw_data[,"participant_ID"])
+
+# sides matching as a numerical variable
+raw_data[,"sides_match_numeric"] = as.numeric(as.logical(raw_data[,"sides_match"]))
+
+raw_data = raw_data %>% 
+  mutate(sides_match_sign = recode(sides_match_numeric,
+                                   "0" = -1,
+                                   "1" = 1))
+
+
+# only sessions conducted with the AMP-TPP3 account is included
+data_nontest = raw_data %>% 
+  filter(experimenter_ID_code == "9a406d975878bdb99a5654687abb56fdfeff48289ccb5292f2639266a75e016d")
+
+
+######################################################################
+#                                                                    #
+#                    AMP-TPP 1 replication analysis                   #
+#                                                                    #
+######################################################################
+
+##################################################################
+#                      Set analysis parameters                   #
+##################################################################
+
+# probability of successful guess if M0 is true
+M0_prob = 0.5
+
+# interim analysis points (in total number of erotic trials performed)
+when_to_check = c(37836, 62388, 86958)
+
+# thresholds to infer support for M0 (high) or M1 (low)
+Inference_threshold_BF_high = 25
+Inference_threshold_BF_low = 1/Inference_threshold_BF_high
+
+# this information is used both for calculating replication Bayes factor, and the Bayesian parameter estimation robustness test. 
+# Here we use data from Bem's experiment 1, 828 successes within 1560 erotic trials
+y_prior = 828 #number of successes in erotic trials in Bem's experiment 1
+N_prior = 1560 # number of erotic trials in Bem's experiment 1
+
+
+# smallest effect size of interest in the NHST equivalence tests 
+# these are used in both the mixed model analysis in the primary analysis
+# and the proportion test in the robustness analysis
+minimum_effect_threshold_NHST = 0.01
+# p threshold for the NHST tests
+# these are used in both the mixed model analysis in the primary analysis
+# and the proportion test in the robustness analysis
+# although, in the primary analysis this is adjusted for multiple testing
+# using Bonferroni's correction
+Inference_threshold_NHST_AMP1mixedrep = 0.005
+Inference_threshold_NHST_AMP1purerep = 0.005
+
+
+##################################################################
+# Set analysis parameters for AMP-TPP 2 replication analysis     #
+##################################################################
+
+max_num_trials_AMP2rep = 127000
+Inference_threshold_NHST_AMP2rep = 0.05
+
+
+##################################################################
+#                      Data management                           #
+##################################################################
+
+########################## Pure sessions ############################
+
+# only pure sessions are included to replicate AMP-TPP1 pure sessions
+data_nontest_AMP1purerep = data_nontest[data_nontest$available_trial_type == 1,]
+
+# add a row_counter, which will be useful to distinguish data coming in after the stopping rule was met.
+data_nontest_AMP1purerep[, "row_counter"] = 1:nrow(data_nontest_AMP1purerep)
+
+# extract trial data only
+data_nontest_AMP1purerep_trials = data_nontest_AMP1purerep[!is.na(data_nontest_AMP1purerep[, "trial_number"]),]
+
+# extract data from erotic trials 
+data_nontest_AMP1purerep_trials_erotic = data_nontest_AMP1purerep_trials[data_nontest_AMP1purerep_trials[, "reward_type"] == "erotic", ]
+# drop unused factor levels
+data_nontest_AMP1purerep_trials_erotic[,"participant_ID"] = droplevels(data_nontest_AMP1purerep_trials_erotic[,"participant_ID"])
+
+# extract data from nonerotic trials 
+data_nontest_AMP1purerep_trials_nonerotic = data_nontest_AMP1purerep_trials[data_nontest_AMP1purerep_trials[, "reward_type"] == "neutral", ]
+# drop unused factor levels
+data_nontest_AMP1purerep_trials_nonerotic[,"participant_ID"] = droplevels(data_nontest_AMP1purerep_trials_nonerotic[,"participant_ID"])
+
+# cumulative sum of success sign
+
+data_nontest_AMP1purerep_trials_erotic$sides_match_sign_cumsum = cumsum(data_nontest_AMP1purerep_trials_erotic$sides_match_sign)
+data_nontest_AMP1purerep_trials_nonerotic$sides_match_sign_cumsum = cumsum(data_nontest_AMP1purerep_trials_nonerotic$sides_match_sign)
+
+
+########################## Mixed sessions ############################
+
+
+# only mixed sessions are included to replicate AMP-TPP1 mixed sessions
+data_nontest_AMP1mixedrep = data_nontest[data_nontest$available_trial_type == 4,]
+
+# add a row_counter, which will be useful to distinguish data coming in after the stopping rule was met.
+data_nontest_AMP1mixedrep[, "row_counter"] = 1:nrow(data_nontest_AMP1mixedrep)
+
+# extract trial data only
+data_nontest_AMP1mixedrep_trials = data_nontest_AMP1mixedrep[!is.na(data_nontest_AMP1mixedrep[, "trial_number"]),]
+
+# extract data from erotic trials 
+data_nontest_AMP1mixedrep_trials_erotic = data_nontest_AMP1mixedrep_trials[data_nontest_AMP1mixedrep_trials[, "reward_type"] == "erotic", ]
+# drop unused factor levels
+data_nontest_AMP1mixedrep_trials_erotic[,"participant_ID"] = droplevels(data_nontest_AMP1mixedrep_trials_erotic[,"participant_ID"])
+
+# extract data from nonerotic trials 
+data_nontest_AMP1mixedrep_trials_nonerotic = data_nontest_AMP1mixedrep_trials[data_nontest_AMP1mixedrep_trials[, "reward_type"] == "neutral", ]
+# drop unused factor levels
+data_nontest_AMP1mixedrep_trials_nonerotic[,"participant_ID"] = droplevels(data_nontest_AMP1mixedrep_trials_nonerotic[,"participant_ID"])
+
+# split data by trial type
+data_nontest_AMP1mixedrep_trials_erotic_sham = data_nontest_AMP1mixedrep_trials_erotic[data_nontest_AMP1mixedrep_trials_erotic[,"trial_type"] == "sh",]
+data_nontest_AMP1mixedrep_trials_erotic_true = data_nontest_AMP1mixedrep_trials_erotic[data_nontest_AMP1mixedrep_trials_erotic[,"trial_type"] == "t",]
+
+data_nontest_AMP1mixedrep_trials_nonerotic_sham = data_nontest_AMP1mixedrep_trials_nonerotic[data_nontest_AMP1mixedrep_trials_nonerotic[,"trial_type"] == "sh",]
+data_nontest_AMP1mixedrep_trials_nonerotic_true = data_nontest_AMP1mixedrep_trials_nonerotic[data_nontest_AMP1mixedrep_trials_nonerotic[,"trial_type"] == "t",]
+
+data_nontest_AMP1mixedrep_trials_sham = data_nontest_AMP1mixedrep_trials[data_nontest_AMP1mixedrep_trials[,"trial_type"] == "sh",]
+data_nontest_AMP1mixedrep_trials_true = data_nontest_AMP1mixedrep_trials[data_nontest_AMP1mixedrep_trials[,"trial_type"] == "t",]
+
+# cumulative sum of success sign
+
+data_nontest_AMP1mixedrep_trials_erotic_true$sides_match_sign_cumsum = cumsum(data_nontest_AMP1mixedrep_trials_erotic_true$sides_match_sign)
+data_nontest_AMP1mixedrep_trials_erotic_sham$sides_match_sign_cumsum = cumsum(data_nontest_AMP1mixedrep_trials_erotic_sham$sides_match_sign)
+data_nontest_AMP1mixedrep_trials_nonerotic_true$sides_match_sign_cumsum = cumsum(data_nontest_AMP1mixedrep_trials_nonerotic_true$sides_match_sign)
+data_nontest_AMP1mixedrep_trials_nonerotic_sham$sides_match_sign_cumsum = cumsum(data_nontest_AMP1mixedrep_trials_nonerotic_sham$sides_match_sign)
+
+
+
+
+
+##################################################################
+#                    Confirmatory analysis                       #
+##################################################################
+
+############################# Pure sessions - erotic ############################
+
+# This section conducts the primary confirmatory analysis at each stopping point.
+# It also cuts the data at the point where one of the stopping rules has been met.
+
+results_table = data.frame(matrix(NA, nrow = 1, ncol = 7))
+names(results_table) = c("Mixed_mod_CIlb", "Mixed_mod_CIub", "mixed_CI_width","BF_replication", "BF_uniform", "BF_BUJ", "checked_at")
+
+# this is a counter to count the number of tests conducted using the mixed model
+# due to sequential testing. This is used to adjust the p-value threshold 
+# for the number of comparions made
+comparisons_Mixed_NHST = 0
+
+for(i in 1:length(when_to_check)){
+  
+  # determin current stopping point and next stopping point
+  current_stopping_point = when_to_check[i]
+  if(i < length(when_to_check)){next_stopping_point = when_to_check[i+1]} else {next_stopping_point = "last"}
+  print(paste("analyzing at reaching", current_stopping_point, "erotic trials"))
+  
+  # sampling starting from the beggining of the full simulated dataset (from the first trial of the first participant) 
+  # until reaching the next interim analysis point
+  data_BF = data_nontest_AMP1purerep_trials_erotic[1:current_stopping_point,]
+  last_row = data_BF[nrow(data_BF), "row_counter"]
+  # number of successes and total N of trials
+  successes = sum(as.logical(data_BF[,"sides_match"]))
+  total_N = current_stopping_point
+  results_table[i, "checked_at"] = current_stopping_point
+  
+  #================================================================#
+  #            Mixed effect logistic regression analysis           #
+  #================================================================#
+  
+  # advance the counter to see how much adjustment needs to be made to the
+  # NHST inference threshold due to multiple testing
+  comparisons_Mixed_NHST = comparisons_Mixed_NHST + 2 # we add 2 at each sequential stopping point because we do two tests at each stop point, one for M0 and one for M1
+  
+  # build mixed logistic regression model and extract model coefficient and SE
+  mod_mixed = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_BF, family = "binomial")
+  estimate_mixed = summary(mod_mixed)$coefficients[1,1]
+  se_mixed = summary(mod_mixed)$coefficients[1,2]
+  
+  # compute confidence interval on the probability scale, and save into results_table
+  results_table[i,"mixed_CI_width"] = 1-(Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST)
+  wald_ci_mixed_logit <- c(estimate_mixed - se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST)/2)),
+                           estimate_mixed + se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST)/2)))
+  wald_ci_mixed = logit2prob(wald_ci_mixed_logit)
+  
+  SE_in_probability_from_mixed_model = logit2prob(estimate_mixed) - logit2prob(estimate_mixed - se_mixed)
+  # just to verify the result, this sould provide very similar result, based on http://www.r-tutor.com/elementary-statistics/interval-estimation/interval-estimate-population-proportion
+  # SE_in_probability_from_proportions = sqrt((successes/total_N)∗ (1 − (successes/total_N))/total_N)
+  
+  
+  results_table[i, "Mixed_mod_CIlb"] = wald_ci_mixed[1]
+  results_table[i, "Mixed_mod_CIub"] = wald_ci_mixed[2]
+  
+  
+  # Statistical inference based on the results of the mixed model analysis  
+  
+  minimum_effect = M0_prob+minimum_effect_threshold_NHST
+  if(results_table[i, "Mixed_mod_CIub"] < minimum_effect){Mixed_NHST_inference = "M0"
+  } else if(results_table[i, "Mixed_mod_CIlb"] > M0_prob){Mixed_NHST_inference = "M1"
+  } else {Mixed_NHST_inference = "Inconclusive"}
+  
+  
+  
+  #================================================================#
+  #        Calculating Bayes factors using different priors        #
+  #================================================================#
+  
+  # as determined in the analysis plan, three different prior distributions are used for M1
+  # to ensure the robustness of the statistical inference to different analytical choices
+  # the same 
+  
+  ### Replication Bayes factor, with the Bem 2011 experiment 1 results providing the prior information
+  
+  BF_replication <- BF01_beta(y = successes, N = total_N, y_prior = y_prior, N_prior = N_prior, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_replication"] = round(BF_replication, 3)
+  BF_replication_inference = BF_inference_function(BF_replication)
+  
+  
+  ### Bayes factor with uniform prior
+  # using a non-informative flat prior distribution with alpha = 1 and beta = 1
+  
+  BF_uniform <- BF01_beta(y = successes, N = total_N, y_prior = 0, N_prior = 0, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_uniform"] = round(BF_uniform, 3)
+  BF_uniform_inference = BF_inference_function(BF_uniform)
+  
+  ### Bayes factor with BUJ prior
+  # the BUJ prior is calculated from Bem's paper where the prior distribution is defined as a
+  # normal distribution with a mean at 0 and 90th percentele is at medium effect size d = 0.5 
+  # (we asume that this is one-tailed). Source: Bem, D. J., Utts, J., & Johnson, W. O. (2011). 
+  # Must psychologists change the way they analyze their data? Journal of Personality and Social Psychology, 101(4), 716-719.
+  # We simulate this in this binomial framework with a one-tailed beta distribution with alpha = 7 and beta = 7.
+  # This distribution has 90% of its probability mass under p = 0.712, which we determined 
+  # to be equivalent to d = 0.5 medium effect size. We used the formula to convert d to log odds ratio logodds = d*pi/sqrt(3), 
+  # found here: Borenstein, M., Hedges, L. V., Higgins, J. P. T., & Rothstein, H. R. (2009). 
+  # Converting Among Effect Sizes. In Introduction to Meta-Analysis (pp. 45-49): John Wiley & Sons, Ltd.
+  # Then, log odds ratio vas converted to probability using the formula: p = exp(x)/(1+exp(x))
+  # The final equation: exp(d*pi/sqrt(3))/(1+exp(d*pi/sqrt(3)))
+  
+  BF_BUJ <- BF01_beta(y = successes, N = total_N, y_prior = 6, N_prior = 12, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_BUJ"] = round(BF_BUJ, 3)
+  BF_BUJ_inference = BF_inference_function(BF_BUJ)
+  
+  
+  #================================================================#
+  #                    Main analysis inference                     #
+  #================================================================#
+  
+  # determine final inference (supported model) based on the inferences drawn
+  # from the mixed model and the Bayes factors 
+  if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M1")) {
+    primary_analysis_inference = "M1"
+    which_threshold_passed = as.character(Inference_threshold_BF_low)
+    print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+    break} else if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M0")) {
+      primary_analysis_inference = "M0"
+      which_threshold_passed = as.character(Inference_threshold_BF_high)
+      print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+      break} else if((next_stopping_point != "last") & (nrow(data_nontest_AMP1purerep_trials_erotic) < next_stopping_point)){
+        primary_analysis_inference = "Ongoing"
+        which_threshold_passed = "Ongoing"
+        print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+        break} else {
+          primary_analysis_inference = "Inconclusive"
+          which_threshold_passed = paste("neither ", Inference_threshold_BF_low, " or ", Inference_threshold_BF_high, sep = "")
+          print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))}
+  
+}
+
+
+data_BF_pure_erotic = data_BF
+last_row_pure_erotic = last_row
+results_table_pure_erotic = results_table
+primary_analysis_inference_pure_erotic = primary_analysis_inference
+total_N_pure_erotic = total_N
+successes_pure_erotic = successes
+SE_in_probability_from_mixed_model_pure_erotic = SE_in_probability_from_mixed_model
+CIlb_in_probability_from_mixed_model_pure_erotic = wald_ci_mixed[1]
+CIub_in_probability_from_mixed_model_pure_erotic = wald_ci_mixed[2]
+which_threshold_passed_pure_erotic = which_threshold_passed
+BF_replication_pure_erotic = BF_replication
+BF_uniform_pure_erotic = BF_uniform
+BF_BUJ_pure_erotic = BF_BUJ
+Inference_threshold_NHST_AMP1purerep_final_erotic = Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST
+estimate_pure_erotic = logit2prob(estimate_mixed)
+
+
+############################# Mixed session - Sham trials - erotic ############################
+
+# This section conducts the primary confirmatory analysis at each stopping point.
+# It also cuts the data at the point where one of the stopping rules has been met.
+
+results_table = data.frame(matrix(NA, nrow = 1, ncol = 7))
+names(results_table) = c("Mixed_mod_CIlb", "Mixed_mod_CIub", "mixed_CI_width","BF_replication", "BF_uniform", "BF_BUJ", "checked_at")
+
+# this is a counter to count the number of tests conducted using the mixed model
+# due to sequential testing. This is used to adjust the p-value threshold 
+# for the number of comparions made
+comparisons_Mixed_NHST = 0
+
+for(i in 1:length(when_to_check)){
+  
+  # determin current stopping point and next stopping point
+  current_stopping_point = when_to_check[i]
+  if(i < length(when_to_check)){next_stopping_point = when_to_check[i+1]} else {next_stopping_point = "last"}
+  print(paste("analyzing at reaching", current_stopping_point, "erotic trials"))
+  
+  # sampling starting from the beggining of the full simulated dataset (from the first trial of the first participant) 
+  # until reaching the next interim analysis point
+  data_BF = data_nontest_AMP1mixedrep_trials_erotic_sham[1:current_stopping_point,]
+  last_row = data_BF[nrow(data_BF), "row_counter"]
+  # number of successes and total N of trials
+  successes = sum(as.logical(data_BF[,"sides_match"]))
+  total_N = current_stopping_point
+  results_table[i, "checked_at"] = current_stopping_point
+  
+  #================================================================#
+  #            Mixed effect logistic regression analysis           #
+  #================================================================#
+  
+  # advance the counter to see how much adjustment needs to be made to the
+  # NHST inference threshold due to multiple testing
+  comparisons_Mixed_NHST = comparisons_Mixed_NHST + 2 # we add 2 at each sequential stopping point because we do two tests at each stop point, one for M0 and one for M1
+  
+  # build mixed logistic regression model and extract model coefficient and SE
+  mod_mixed = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_BF, family = "binomial")
+  estimate_mixed = summary(mod_mixed)$coefficients[1,1]
+  se_mixed = summary(mod_mixed)$coefficients[1,2]
+  
+  # compute confidence interval on the probability scale, and save into results_table
+  results_table[i,"mixed_CI_width"] = 1-(Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)
+  wald_ci_mixed_logit <- c(estimate_mixed - se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)),
+                           estimate_mixed + se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)))
+  wald_ci_mixed = logit2prob(wald_ci_mixed_logit)
+  
+  SE_in_probability_from_mixed_model = logit2prob(estimate_mixed) - logit2prob(estimate_mixed - se_mixed)
+  # just to verify the result, this sould provide very similar result, based on http://www.r-tutor.com/elementary-statistics/interval-estimation/interval-estimate-population-proportion
+  # SE_in_probability_from_proportions = sqrt((successes/total_N)∗ (1 − (successes/total_N))/total_N)
+  
+  
+  results_table[i, "Mixed_mod_CIlb"] = wald_ci_mixed[1]
+  results_table[i, "Mixed_mod_CIub"] = wald_ci_mixed[2]
+  
+  
+  # Statistical inference based on the results of the mixed model analysis  
+  
+  minimum_effect = M0_prob+minimum_effect_threshold_NHST
+  if(results_table[i, "Mixed_mod_CIub"] < minimum_effect){Mixed_NHST_inference = "M0"
+  } else if(results_table[i, "Mixed_mod_CIlb"] > M0_prob){Mixed_NHST_inference = "M1"
+  } else {Mixed_NHST_inference = "Inconclusive"}
+  
+  #================================================================#
+  #        Calculating Bayes factors using different priors        #
+  #================================================================#
+  
+  # as determined in the analysis plan, three different prior distributions are used for M1
+  # to ensure the robustness of the statistical inference to different analytical choices
+  # the same 
+  
+  ### Replication Bayes factor, with the Bem 2011 experiment 1 results providing the prior information
+  
+  BF_replication <- BF01_beta(y = successes, N = total_N, y_prior = y_prior, N_prior = N_prior, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_replication"] = round(BF_replication, 3)
+  BF_replication_inference = BF_inference_function(BF_replication)
+  
+  
+  ### Bayes factor with uniform prior
+  # using a non-informative flat prior distribution with alpha = 1 and beta = 1
+  
+  BF_uniform <- BF01_beta(y = successes, N = total_N, y_prior = 0, N_prior = 0, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_uniform"] = round(BF_uniform, 3)
+  BF_uniform_inference = BF_inference_function(BF_uniform)
+  
+  ### Bayes factor with BUJ prior
+  # the BUJ prior is calculated from Bem's paper where the prior distribution is defined as a
+  # normal distribution with a mean at 0 and 90th percentele is at medium effect size d = 0.5 
+  # (we asume that this is one-tailed). Source: Bem, D. J., Utts, J., & Johnson, W. O. (2011). 
+  # Must psychologists change the way they analyze their data? Journal of Personality and Social Psychology, 101(4), 716-719.
+  # We simulate this in this binomial framework with a one-tailed beta distribution with alpha = 7 and beta = 7.
+  # This distribution has 90% of its probability mass under p = 0.712, which we determined 
+  # to be equivalent to d = 0.5 medium effect size. We used the formula to convert d to log odds ratio logodds = d*pi/sqrt(3), 
+  # found here: Borenstein, M., Hedges, L. V., Higgins, J. P. T., & Rothstein, H. R. (2009). 
+  # Converting Among Effect Sizes. In Introduction to Meta-Analysis (pp. 45-49): John Wiley & Sons, Ltd.
+  # Then, log odds ratio vas converted to probability using the formula: p = exp(x)/(1+exp(x))
+  # The final equation: exp(d*pi/sqrt(3))/(1+exp(d*pi/sqrt(3)))
+  
+  BF_BUJ <- BF01_beta(y = successes, N = total_N, y_prior = 6, N_prior = 12, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_BUJ"] = round(BF_BUJ, 3)
+  BF_BUJ_inference = BF_inference_function(BF_BUJ)
+  
+  
+  #================================================================#
+  #                    Main analysis inference                     #
+  #================================================================#
+  
+  # determine final inference (supported model) based on the inferences drawn
+  # from the mixed model and the Bayes factors 
+  if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M1")) {
+    primary_analysis_inference = "M1"
+    which_threshold_passed = as.character(Inference_threshold_BF_low)
+    print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+    break} else if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M0")) {
+      primary_analysis_inference = "M0"
+      which_threshold_passed = as.character(Inference_threshold_BF_high)
+      print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+      break} else if((next_stopping_point != "last") & (nrow(data_nontest_AMP1mixedrep_trials_erotic_sham) < next_stopping_point)){
+        primary_analysis_inference = "Ongoing"
+        which_threshold_passed = "Ongoing"
+        print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+        break} else {
+          primary_analysis_inference = "Inconclusive"
+          which_threshold_passed = paste("neither ", Inference_threshold_BF_low, " or ", Inference_threshold_BF_high, sep = "")
+          print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))}
+  
+}
+
+data_BF_sham_erotic = data_BF
+last_row_sham_erotic = last_row
+results_table_sham_erotic = results_table
+primary_analysis_inference_sham_erotic = primary_analysis_inference
+total_N_sham_erotic = total_N
+successes_sham_erotic = successes
+SE_in_probability_from_mixed_model_sham_erotic = SE_in_probability_from_mixed_model
+CIlb_in_probability_from_mixed_model_sham_erotic = wald_ci_mixed[1]
+CIub_in_probability_from_mixed_model_sham_erotic = wald_ci_mixed[2]
+which_threshold_passed_sham_erotic = which_threshold_passed
+BF_replication_sham_erotic = BF_replication
+BF_uniform_sham_erotic = BF_uniform
+BF_BUJ_sham_erotic = BF_BUJ
+Inference_threshold_NHST_AMP1mixedrep_final_sham_erotic = Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST
+estimate_sham_erotic = logit2prob(estimate_mixed)
+
+
+############################# Mixed session - True trials - erotic ############################
+
+# This section conducts the primary confirmatory analysis at each stopping point.
+# It also cuts the data at the point where one of the stopping rules has been met.
+
+results_table = data.frame(matrix(NA, nrow = 1, ncol = 7))
+names(results_table) = c("Mixed_mod_CIlb", "Mixed_mod_CIub", "mixed_CI_width","BF_replication", "BF_uniform", "BF_BUJ", "checked_at")
+
+# this is a counter to count the number of tests conducted using the mixed model
+# due to sequential testing. This is used to adjust the p-value threshold 
+# for the number of comparions made
+comparisons_Mixed_NHST = 0
+
+for(i in 1:length(when_to_check)){
+  
+  # determin current stopping point and next stopping point
+  current_stopping_point = when_to_check[i]
+  if(i < length(when_to_check)){next_stopping_point = when_to_check[i+1]} else {next_stopping_point = "last"}
+  print(paste("analyzing at reaching", current_stopping_point, "erotic trials"))
+  
+  # sampling starting from the beggining of the full simulated dataset (from the first trial of the first participant) 
+  # until reaching the next interim analysis point
+  data_BF = data_nontest_AMP1mixedrep_trials_erotic_true[1:current_stopping_point,]
+  last_row = data_BF[nrow(data_BF), "row_counter"]
+  # number of successes and total N of trials
+  successes = sum(as.logical(data_BF[,"sides_match"]))
+  total_N = current_stopping_point
+  results_table[i, "checked_at"] = current_stopping_point
+  
+  #================================================================#
+  #            Mixed effect logistic regression analysis           #
+  #================================================================#
+  
+  # advance the counter to see how much adjustment needs to be made to the
+  # NHST inference threshold due to multiple testing
+  comparisons_Mixed_NHST = comparisons_Mixed_NHST + 2 # we add 2 at each sequential stopping point because we do two tests at each stop point, one for M0 and one for M1
+  
+  # build mixed logistic regression model and extract model coefficient and SE
+  mod_mixed = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_BF, family = "binomial")
+  estimate_mixed = summary(mod_mixed)$coefficients[1,1]
+  se_mixed = summary(mod_mixed)$coefficients[1,2]
+  
+  # compute confidence interval on the probability scale, and save into results_table
+  results_table[i,"mixed_CI_width"] = 1-(Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)
+  wald_ci_mixed_logit <- c(estimate_mixed - se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)),
+                           estimate_mixed + se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)))
+  wald_ci_mixed = logit2prob(wald_ci_mixed_logit)
+  
+  SE_in_probability_from_mixed_model = logit2prob(estimate_mixed) - logit2prob(estimate_mixed - se_mixed)
+  # just to verify the result, this sould provide very similar result, based on http://www.r-tutor.com/elementary-statistics/interval-estimation/interval-estimate-population-proportion
+  # SE_in_probability_from_proportions = sqrt((successes/total_N)∗ (1 − (successes/total_N))/total_N)
+  
+  
+  results_table[i, "Mixed_mod_CIlb"] = wald_ci_mixed[1]
+  results_table[i, "Mixed_mod_CIub"] = wald_ci_mixed[2]
+  
+  
+  # Statistical inference based on the results of the mixed model analysis  
+  
+  minimum_effect = M0_prob+minimum_effect_threshold_NHST
+  if(results_table[i, "Mixed_mod_CIub"] < minimum_effect){Mixed_NHST_inference = "M0"
+  } else if(results_table[i, "Mixed_mod_CIlb"] > M0_prob){Mixed_NHST_inference = "M1"
+  } else {Mixed_NHST_inference = "Inconclusive"}
+  
+  
+  
+  #================================================================#
+  #        Calculating Bayes factors using different priors        #
+  #================================================================#
+  
+  # as determined in the analysis plan, three different prior distributions are used for M1
+  # to ensure the robustness of the statistical inference to different analytical choices
+  # the same 
+  
+  ### Replication Bayes factor, with the Bem 2011 experiment 1 results providing the prior information
+  
+  BF_replication <- BF01_beta(y = successes, N = total_N, y_prior = y_prior, N_prior = N_prior, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_replication"] = round(BF_replication, 3)
+  BF_replication_inference = BF_inference_function(BF_replication)
+  
+  
+  ### Bayes factor with uniform prior
+  # using a non-informative flat prior distribution with alpha = 1 and beta = 1
+  
+  BF_uniform <- BF01_beta(y = successes, N = total_N, y_prior = 0, N_prior = 0, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_uniform"] = round(BF_uniform, 3)
+  BF_uniform_inference = BF_inference_function(BF_uniform)
+  
+  ### Bayes factor with BUJ prior
+  # the BUJ prior is calculated from Bem's paper where the prior distribution is defined as a
+  # normal distribution with a mean at 0 and 90th percentele is at medium effect size d = 0.5 
+  # (we asume that this is one-tailed). Source: Bem, D. J., Utts, J., & Johnson, W. O. (2011). 
+  # Must psychologists change the way they analyze their data? Journal of Personality and Social Psychology, 101(4), 716-719.
+  # We simulate this in this binomial framework with a one-tailed beta distribution with alpha = 7 and beta = 7.
+  # This distribution has 90% of its probability mass under p = 0.712, which we determined 
+  # to be equivalent to d = 0.5 medium effect size. We used the formula to convert d to log odds ratio logodds = d*pi/sqrt(3), 
+  # found here: Borenstein, M., Hedges, L. V., Higgins, J. P. T., & Rothstein, H. R. (2009). 
+  # Converting Among Effect Sizes. In Introduction to Meta-Analysis (pp. 45-49): John Wiley & Sons, Ltd.
+  # Then, log odds ratio vas converted to probability using the formula: p = exp(x)/(1+exp(x))
+  # The final equation: exp(d*pi/sqrt(3))/(1+exp(d*pi/sqrt(3)))
+  
+  BF_BUJ <- BF01_beta(y = successes, N = total_N, y_prior = 6, N_prior = 12, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_BUJ"] = round(BF_BUJ, 3)
+  BF_BUJ_inference = BF_inference_function(BF_BUJ)
+  
+  
+  #================================================================#
+  #                    Main analysis inference                     #
+  #================================================================#
+  
+  # determine final inference (supported model) based on the inferences drawn
+  # from the mixed model and the Bayes factors 
+  if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M1")) {
+    primary_analysis_inference = "M1"
+    which_threshold_passed = as.character(Inference_threshold_BF_low)
+    print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+    break} else if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M0")) {
+      primary_analysis_inference = "M0"
+      which_threshold_passed = as.character(Inference_threshold_BF_high)
+      print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+      break} else if((next_stopping_point != "last") & (nrow(data_nontest_AMP1mixedrep_trials_erotic_true) < next_stopping_point)){
+        primary_analysis_inference = "Ongoing"
+        which_threshold_passed = "Ongoing"
+        print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+        break} else {
+          primary_analysis_inference = "Inconclusive"
+          which_threshold_passed = paste("neither ", Inference_threshold_BF_low, " or ", Inference_threshold_BF_high, sep = "")
+          print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))}
+  
+}
+
+data_BF_true_erotic = data_BF
+last_row_true_erotic = last_row
+results_table_true_erotic = results_table
+primary_analysis_inference_true_erotic = primary_analysis_inference
+total_N_true_erotic = total_N
+successes_true_erotic = successes
+SE_in_probability_from_mixed_model_true_erotic = SE_in_probability_from_mixed_model
+CIlb_in_probability_from_mixed_model_true_erotic = wald_ci_mixed[1]
+CIub_in_probability_from_mixed_model_true_erotic = wald_ci_mixed[2]
+which_threshold_passed_true_erotic = which_threshold_passed
+BF_replication_true_erotic = BF_replication
+BF_uniform_true_erotic = BF_uniform
+BF_BUJ_true_erotic = BF_BUJ
+Inference_threshold_NHST_AMP1mixedrep_final_true_erotic = Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST
+estimate_true_erotic = logit2prob(estimate_mixed)
+
+
+
+
+
+
+
+
+
+############################# Pure sessions - nonerotic ############################
+
+# This section conducts the primary confirmatory analysis at each stopping point.
+# It also cuts the data at the point where one of the stopping rules has been met.
+
+results_table = data.frame(matrix(NA, nrow = 1, ncol = 7))
+names(results_table) = c("Mixed_mod_CIlb", "Mixed_mod_CIub", "mixed_CI_width","BF_replication", "BF_uniform", "BF_BUJ", "checked_at")
+
+# this is a counter to count the number of tests conducted using the mixed model
+# due to sequential testing. This is used to adjust the p-value threshold 
+# for the number of comparions made
+comparisons_Mixed_NHST = 0
+
+for(i in 1:length(when_to_check)){
+  
+  # determin current stopping point and next stopping point
+  current_stopping_point = when_to_check[i]
+  if(i < length(when_to_check)){next_stopping_point = when_to_check[i+1]} else {next_stopping_point = "last"}
+  print(paste("analyzing at reaching", current_stopping_point, "erotic trials"))
+  
+  # sampling starting from the beggining of the full simulated dataset (from the first trial of the first participant) 
+  # until reaching the next interim analysis point
+  data_BF = data_nontest_AMP1purerep_trials_nonerotic[1:current_stopping_point,]
+  last_row = data_BF[nrow(data_BF), "row_counter"]
+  # number of successes and total N of trials
+  successes = sum(as.logical(data_BF[,"sides_match"]))
+  total_N = current_stopping_point
+  results_table[i, "checked_at"] = current_stopping_point
+  
+  #================================================================#
+  #            Mixed effect logistic regression analysis           #
+  #================================================================#
+  
+  # advance the counter to see how much adjustment needs to be made to the
+  # NHST inference threshold due to multiple testing
+  comparisons_Mixed_NHST = comparisons_Mixed_NHST + 2 # we add 2 at each sequential stopping point because we do two tests at each stop point, one for M0 and one for M1
+  
+  # build mixed logistic regression model and extract model coefficient and SE
+  mod_mixed = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_BF, family = "binomial")
+  estimate_mixed = summary(mod_mixed)$coefficients[1,1]
+  se_mixed = summary(mod_mixed)$coefficients[1,2]
+  
+  # compute confidence interval on the probability scale, and save into results_table
+  results_table[i,"mixed_CI_width"] = 1-(Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST)
+  wald_ci_mixed_logit <- c(estimate_mixed - se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST)/2)),
+                           estimate_mixed + se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST)/2)))
+  wald_ci_mixed = logit2prob(wald_ci_mixed_logit)
+  
+  SE_in_probability_from_mixed_model = logit2prob(estimate_mixed) - logit2prob(estimate_mixed - se_mixed)
+  # just to verify the result, this sould provide very similar result, based on http://www.r-tutor.com/elementary-statistics/interval-estimation/interval-estimate-population-proportion
+  # SE_in_probability_from_proportions = sqrt((successes/total_N)∗ (1 − (successes/total_N))/total_N)
+  
+  
+  results_table[i, "Mixed_mod_CIlb"] = wald_ci_mixed[1]
+  results_table[i, "Mixed_mod_CIub"] = wald_ci_mixed[2]
+  
+  
+  # Statistical inference based on the results of the mixed model analysis  
+  
+  minimum_effect = M0_prob+minimum_effect_threshold_NHST
+  if(results_table[i, "Mixed_mod_CIub"] < minimum_effect){Mixed_NHST_inference = "M0"
+  } else if(results_table[i, "Mixed_mod_CIlb"] > M0_prob){Mixed_NHST_inference = "M1"
+  } else {Mixed_NHST_inference = "Inconclusive"}
+  
+  
+  
+  #================================================================#
+  #        Calculating Bayes factors using different priors        #
+  #================================================================#
+  
+  # as determined in the analysis plan, three different prior distributions are used for M1
+  # to ensure the robustness of the statistical inference to different analytical choices
+  # the same 
+  
+  ### Replication Bayes factor, with the Bem 2011 experiment 1 results providing the prior information
+  
+  BF_replication <- BF01_beta(y = successes, N = total_N, y_prior = y_prior, N_prior = N_prior, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_replication"] = round(BF_replication, 3)
+  BF_replication_inference = BF_inference_function(BF_replication)
+  
+  
+  ### Bayes factor with uniform prior
+  # using a non-informative flat prior distribution with alpha = 1 and beta = 1
+  
+  BF_uniform <- BF01_beta(y = successes, N = total_N, y_prior = 0, N_prior = 0, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_uniform"] = round(BF_uniform, 3)
+  BF_uniform_inference = BF_inference_function(BF_uniform)
+  
+  ### Bayes factor with BUJ prior
+  # the BUJ prior is calculated from Bem's paper where the prior distribution is defined as a
+  # normal distribution with a mean at 0 and 90th percentele is at medium effect size d = 0.5 
+  # (we asume that this is one-tailed). Source: Bem, D. J., Utts, J., & Johnson, W. O. (2011). 
+  # Must psychologists change the way they analyze their data? Journal of Personality and Social Psychology, 101(4), 716-719.
+  # We simulate this in this binomial framework with a one-tailed beta distribution with alpha = 7 and beta = 7.
+  # This distribution has 90% of its probability mass under p = 0.712, which we determined 
+  # to be equivalent to d = 0.5 medium effect size. We used the formula to convert d to log odds ratio logodds = d*pi/sqrt(3), 
+  # found here: Borenstein, M., Hedges, L. V., Higgins, J. P. T., & Rothstein, H. R. (2009). 
+  # Converting Among Effect Sizes. In Introduction to Meta-Analysis (pp. 45-49): John Wiley & Sons, Ltd.
+  # Then, log odds ratio vas converted to probability using the formula: p = exp(x)/(1+exp(x))
+  # The final equation: exp(d*pi/sqrt(3))/(1+exp(d*pi/sqrt(3)))
+  
+  BF_BUJ <- BF01_beta(y = successes, N = total_N, y_prior = 6, N_prior = 12, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_BUJ"] = round(BF_BUJ, 3)
+  BF_BUJ_inference = BF_inference_function(BF_BUJ)
+  
+  
+  #================================================================#
+  #                    Main analysis inference                     #
+  #================================================================#
+  
+  # determine final inference (supported model) based on the inferences drawn
+  # from the mixed model and the Bayes factors 
+  if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M1")) {
+    primary_analysis_inference = "M1"
+    which_threshold_passed = as.character(Inference_threshold_BF_low)
+    print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+    break} else if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M0")) {
+      primary_analysis_inference = "M0"
+      which_threshold_passed = as.character(Inference_threshold_BF_high)
+      print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+      break} else if((next_stopping_point != "last") & (nrow(data_nontest_AMP1purerep_trials_nonerotic) < next_stopping_point)){
+        primary_analysis_inference = "Ongoing"
+        which_threshold_passed = "Ongoing"
+        print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+        break} else {
+          primary_analysis_inference = "Inconclusive"
+          which_threshold_passed = paste("neither ", Inference_threshold_BF_low, " or ", Inference_threshold_BF_high, sep = "")
+          print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))}
+  
+}
+
+
+data_BF_pure_nonerotic = data_BF
+last_row_pure_nonerotic = last_row
+results_table_pure_nonerotic = results_table
+primary_analysis_inference_pure_nonerotic = primary_analysis_inference
+total_N_pure_nonerotic = total_N
+successes_pure_nonerotic = successes
+SE_in_probability_from_mixed_model_pure_nonerotic = SE_in_probability_from_mixed_model
+CIlb_in_probability_from_mixed_model_pure_nonerotic = wald_ci_mixed[1]
+CIub_in_probability_from_mixed_model_pure_nonerotic = wald_ci_mixed[2]
+which_threshold_passed_pure_nonerotic = which_threshold_passed
+BF_replication_pure_nonerotic = BF_replication
+BF_uniform_pure_nonerotic = BF_uniform
+BF_BUJ_pure_nonerotic = BF_BUJ
+Inference_threshold_NHST_AMP1purerep_final_nonerotic = Inference_threshold_NHST_AMP1purerep/comparisons_Mixed_NHST
+estimate_pure_nonerotic = logit2prob(estimate_mixed)
+
+
+
+############################# Mixed session - Sham trials - nonerotic ############################
+
+# This section conducts the primary confirmatory analysis at each stopping point.
+# It also cuts the data at the point where one of the stopping rules has been met.
+
+results_table = data.frame(matrix(NA, nrow = 1, ncol = 7))
+names(results_table) = c("Mixed_mod_CIlb", "Mixed_mod_CIub", "mixed_CI_width","BF_replication", "BF_uniform", "BF_BUJ", "checked_at")
+
+# this is a counter to count the number of tests conducted using the mixed model
+# due to sequential testing. This is used to adjust the p-value threshold 
+# for the number of comparions made
+comparisons_Mixed_NHST = 0
+
+for(i in 1:length(when_to_check)){
+  
+  # determin current stopping point and next stopping point
+  current_stopping_point = when_to_check[i]
+  if(i < length(when_to_check)){next_stopping_point = when_to_check[i+1]} else {next_stopping_point = "last"}
+  print(paste("analyzing at reaching", current_stopping_point, "erotic trials"))
+  
+  # sampling starting from the beggining of the full simulated dataset (from the first trial of the first participant) 
+  # until reaching the next interim analysis point
+  data_BF = data_nontest_AMP1mixedrep_trials_nonerotic_sham[1:current_stopping_point,]
+  last_row = data_BF[nrow(data_BF), "row_counter"]
+  # number of successes and total N of trials
+  successes = sum(as.logical(data_BF[,"sides_match"]))
+  total_N = current_stopping_point
+  results_table[i, "checked_at"] = current_stopping_point
+  
+  #================================================================#
+  #            Mixed effect logistic regression analysis           #
+  #================================================================#
+  
+  # advance the counter to see how much adjustment needs to be made to the
+  # NHST inference threshold due to multiple testing
+  comparisons_Mixed_NHST = comparisons_Mixed_NHST + 2 # we add 2 at each sequential stopping point because we do two tests at each stop point, one for M0 and one for M1
+  
+  # build mixed logistic regression model and extract model coefficient and SE
+  mod_mixed = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_BF, family = "binomial")
+  estimate_mixed = summary(mod_mixed)$coefficients[1,1]
+  se_mixed = summary(mod_mixed)$coefficients[1,2]
+  
+  # compute confidence interval on the probability scale, and save into results_table
+  results_table[i,"mixed_CI_width"] = 1-(Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)
+  wald_ci_mixed_logit <- c(estimate_mixed - se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)),
+                           estimate_mixed + se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)))
+  wald_ci_mixed = logit2prob(wald_ci_mixed_logit)
+  
+  SE_in_probability_from_mixed_model = logit2prob(estimate_mixed) - logit2prob(estimate_mixed - se_mixed)
+  # just to verify the result, this sould provide very similar result, based on http://www.r-tutor.com/elementary-statistics/interval-estimation/interval-estimate-population-proportion
+  # SE_in_probability_from_proportions = sqrt((successes/total_N)∗ (1 − (successes/total_N))/total_N)
+  
+  
+  results_table[i, "Mixed_mod_CIlb"] = wald_ci_mixed[1]
+  results_table[i, "Mixed_mod_CIub"] = wald_ci_mixed[2]
+  
+  
+  # Statistical inference based on the results of the mixed model analysis  
+  
+  minimum_effect = M0_prob+minimum_effect_threshold_NHST
+  if(results_table[i, "Mixed_mod_CIub"] < minimum_effect){Mixed_NHST_inference = "M0"
+  } else if(results_table[i, "Mixed_mod_CIlb"] > M0_prob){Mixed_NHST_inference = "M1"
+  } else {Mixed_NHST_inference = "Inconclusive"}
+  
+  #================================================================#
+  #        Calculating Bayes factors using different priors        #
+  #================================================================#
+  
+  # as determined in the analysis plan, three different prior distributions are used for M1
+  # to ensure the robustness of the statistical inference to different analytical choices
+  # the same 
+  
+  ### Replication Bayes factor, with the Bem 2011 experiment 1 results providing the prior information
+  
+  BF_replication <- BF01_beta(y = successes, N = total_N, y_prior = y_prior, N_prior = N_prior, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_replication"] = round(BF_replication, 3)
+  BF_replication_inference = BF_inference_function(BF_replication)
+  
+  
+  ### Bayes factor with uniform prior
+  # using a non-informative flat prior distribution with alpha = 1 and beta = 1
+  
+  BF_uniform <- BF01_beta(y = successes, N = total_N, y_prior = 0, N_prior = 0, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_uniform"] = round(BF_uniform, 3)
+  BF_uniform_inference = BF_inference_function(BF_uniform)
+  
+  ### Bayes factor with BUJ prior
+  # the BUJ prior is calculated from Bem's paper where the prior distribution is defined as a
+  # normal distribution with a mean at 0 and 90th percentele is at medium effect size d = 0.5 
+  # (we asume that this is one-tailed). Source: Bem, D. J., Utts, J., & Johnson, W. O. (2011). 
+  # Must psychologists change the way they analyze their data? Journal of Personality and Social Psychology, 101(4), 716-719.
+  # We simulate this in this binomial framework with a one-tailed beta distribution with alpha = 7 and beta = 7.
+  # This distribution has 90% of its probability mass under p = 0.712, which we determined 
+  # to be equivalent to d = 0.5 medium effect size. We used the formula to convert d to log odds ratio logodds = d*pi/sqrt(3), 
+  # found here: Borenstein, M., Hedges, L. V., Higgins, J. P. T., & Rothstein, H. R. (2009). 
+  # Converting Among Effect Sizes. In Introduction to Meta-Analysis (pp. 45-49): John Wiley & Sons, Ltd.
+  # Then, log odds ratio vas converted to probability using the formula: p = exp(x)/(1+exp(x))
+  # The final equation: exp(d*pi/sqrt(3))/(1+exp(d*pi/sqrt(3)))
+  
+  BF_BUJ <- BF01_beta(y = successes, N = total_N, y_prior = 6, N_prior = 12, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_BUJ"] = round(BF_BUJ, 3)
+  BF_BUJ_inference = BF_inference_function(BF_BUJ)
+  
+  
+  #================================================================#
+  #                    Main analysis inference                     #
+  #================================================================#
+  
+  # determine final inference (supported model) based on the inferences drawn
+  # from the mixed model and the Bayes factors 
+  if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M1")) {
+    primary_analysis_inference = "M1"
+    which_threshold_passed = as.character(Inference_threshold_BF_low)
+    print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+    break} else if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M0")) {
+      primary_analysis_inference = "M0"
+      which_threshold_passed = as.character(Inference_threshold_BF_high)
+      print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+      break} else if((next_stopping_point != "last") & (nrow(data_nontest_AMP1mixedrep_trials_nonerotic_sham) < next_stopping_point)){
+        primary_analysis_inference = "Ongoing"
+        which_threshold_passed = "Ongoing"
+        print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+        break} else {
+          primary_analysis_inference = "Inconclusive"
+          which_threshold_passed = paste("neither ", Inference_threshold_BF_low, " or ", Inference_threshold_BF_high, sep = "")
+          print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))}
+  
+}
+
+data_BF_sham_nonerotic = data_BF
+last_row_sham_nonerotic = last_row
+results_table_sham_nonerotic = results_table
+primary_analysis_inference_sham_nonerotic = primary_analysis_inference
+total_N_sham_nonerotic = total_N
+successes_sham_nonerotic = successes
+SE_in_probability_from_mixed_model_sham_nonerotic = SE_in_probability_from_mixed_model
+CIlb_in_probability_from_mixed_model_sham_nonerotic = wald_ci_mixed[1]
+CIub_in_probability_from_mixed_model_sham_nonerotic = wald_ci_mixed[2]
+which_threshold_passed_sham_nonerotic = which_threshold_passed
+BF_replication_sham_nonerotic = BF_replication
+BF_uniform_sham_nonerotic = BF_uniform
+BF_BUJ_sham_nonerotic = BF_BUJ
+Inference_threshold_NHST_AMP1mixedrep_final_sham_nonerotic = Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST
+estimate_sham_nonerotic = logit2prob(estimate_mixed)
+
+
+############################# Mixed session - True trials - nonerotic ############################
+
+# This section conducts the primary confirmatory analysis at each stopping point.
+# It also cuts the data at the point where one of the stopping rules has been met.
+
+results_table = data.frame(matrix(NA, nrow = 1, ncol = 7))
+names(results_table) = c("Mixed_mod_CIlb", "Mixed_mod_CIub", "mixed_CI_width","BF_replication", "BF_uniform", "BF_BUJ", "checked_at")
+
+# this is a counter to count the number of tests conducted using the mixed model
+# due to sequential testing. This is used to adjust the p-value threshold 
+# for the number of comparions made
+comparisons_Mixed_NHST = 0
+
+for(i in 1:length(when_to_check)){
+  
+  # determin current stopping point and next stopping point
+  current_stopping_point = when_to_check[i]
+  if(i < length(when_to_check)){next_stopping_point = when_to_check[i+1]} else {next_stopping_point = "last"}
+  print(paste("analyzing at reaching", current_stopping_point, "erotic trials"))
+  
+  # sampling starting from the beggining of the full simulated dataset (from the first trial of the first participant) 
+  # until reaching the next interim analysis point
+  data_BF = data_nontest_AMP1mixedrep_trials_nonerotic_true[1:current_stopping_point,]
+  last_row = data_BF[nrow(data_BF), "row_counter"]
+  # number of successes and total N of trials
+  successes = sum(as.logical(data_BF[,"sides_match"]))
+  total_N = current_stopping_point
+  results_table[i, "checked_at"] = current_stopping_point
+  
+  #================================================================#
+  #            Mixed effect logistic regression analysis           #
+  #================================================================#
+  
+  # advance the counter to see how much adjustment needs to be made to the
+  # NHST inference threshold due to multiple testing
+  comparisons_Mixed_NHST = comparisons_Mixed_NHST + 2 # we add 2 at each sequential stopping point because we do two tests at each stop point, one for M0 and one for M1
+  
+  # build mixed logistic regression model and extract model coefficient and SE
+  mod_mixed = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_BF, family = "binomial")
+  estimate_mixed = summary(mod_mixed)$coefficients[1,1]
+  se_mixed = summary(mod_mixed)$coefficients[1,2]
+  
+  # compute confidence interval on the probability scale, and save into results_table
+  results_table[i,"mixed_CI_width"] = 1-(Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)
+  wald_ci_mixed_logit <- c(estimate_mixed - se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)),
+                           estimate_mixed + se_mixed* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST)/2)))
+  wald_ci_mixed = logit2prob(wald_ci_mixed_logit)
+  
+  SE_in_probability_from_mixed_model = logit2prob(estimate_mixed) - logit2prob(estimate_mixed - se_mixed)
+  # just to verify the result, this sould provide very similar result, based on http://www.r-tutor.com/elementary-statistics/interval-estimation/interval-estimate-population-proportion
+  # SE_in_probability_from_proportions = sqrt((successes/total_N)∗ (1 − (successes/total_N))/total_N)
+  
+  
+  results_table[i, "Mixed_mod_CIlb"] = wald_ci_mixed[1]
+  results_table[i, "Mixed_mod_CIub"] = wald_ci_mixed[2]
+  
+  
+  # Statistical inference based on the results of the mixed model analysis  
+  
+  minimum_effect = M0_prob+minimum_effect_threshold_NHST
+  if(results_table[i, "Mixed_mod_CIub"] < minimum_effect){Mixed_NHST_inference = "M0"
+  } else if(results_table[i, "Mixed_mod_CIlb"] > M0_prob){Mixed_NHST_inference = "M1"
+  } else {Mixed_NHST_inference = "Inconclusive"}
+  
+  
+  
+  #================================================================#
+  #        Calculating Bayes factors using different priors        #
+  #================================================================#
+  
+  # as determined in the analysis plan, three different prior distributions are used for M1
+  # to ensure the robustness of the statistical inference to different analytical choices
+  # the same 
+  
+  ### Replication Bayes factor, with the Bem 2011 experiment 1 results providing the prior information
+  
+  BF_replication <- BF01_beta(y = successes, N = total_N, y_prior = y_prior, N_prior = N_prior, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_replication"] = round(BF_replication, 3)
+  BF_replication_inference = BF_inference_function(BF_replication)
+  
+  
+  ### Bayes factor with uniform prior
+  # using a non-informative flat prior distribution with alpha = 1 and beta = 1
+  
+  BF_uniform <- BF01_beta(y = successes, N = total_N, y_prior = 0, N_prior = 0, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_uniform"] = round(BF_uniform, 3)
+  BF_uniform_inference = BF_inference_function(BF_uniform)
+  
+  ### Bayes factor with BUJ prior
+  # the BUJ prior is calculated from Bem's paper where the prior distribution is defined as a
+  # normal distribution with a mean at 0 and 90th percentele is at medium effect size d = 0.5 
+  # (we asume that this is one-tailed). Source: Bem, D. J., Utts, J., & Johnson, W. O. (2011). 
+  # Must psychologists change the way they analyze their data? Journal of Personality and Social Psychology, 101(4), 716-719.
+  # We simulate this in this binomial framework with a one-tailed beta distribution with alpha = 7 and beta = 7.
+  # This distribution has 90% of its probability mass under p = 0.712, which we determined 
+  # to be equivalent to d = 0.5 medium effect size. We used the formula to convert d to log odds ratio logodds = d*pi/sqrt(3), 
+  # found here: Borenstein, M., Hedges, L. V., Higgins, J. P. T., & Rothstein, H. R. (2009). 
+  # Converting Among Effect Sizes. In Introduction to Meta-Analysis (pp. 45-49): John Wiley & Sons, Ltd.
+  # Then, log odds ratio vas converted to probability using the formula: p = exp(x)/(1+exp(x))
+  # The final equation: exp(d*pi/sqrt(3))/(1+exp(d*pi/sqrt(3)))
+  
+  BF_BUJ <- BF01_beta(y = successes, N = total_N, y_prior = 6, N_prior = 12, interval = c(0.5,1), null_prob = M0_prob) #numbers higher than 1 support the null
+  results_table[i, "BF_BUJ"] = round(BF_BUJ, 3)
+  BF_BUJ_inference = BF_inference_function(BF_BUJ)
+  
+  
+  #================================================================#
+  #                    Main analysis inference                     #
+  #================================================================#
+  
+  # determine final inference (supported model) based on the inferences drawn
+  # from the mixed model and the Bayes factors 
+  if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M1")) {
+    primary_analysis_inference = "M1"
+    which_threshold_passed = as.character(Inference_threshold_BF_low)
+    print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+    break} else if(all(c(Mixed_NHST_inference, BF_replication_inference, BF_uniform_inference, BF_BUJ_inference) == "M0")) {
+      primary_analysis_inference = "M0"
+      which_threshold_passed = as.character(Inference_threshold_BF_high)
+      print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+      break} else if((next_stopping_point != "last") & (nrow(data_nontest_AMP1mixedrep_trials_nonerotic_true) < next_stopping_point)){
+        primary_analysis_inference = "Ongoing"
+        which_threshold_passed = "Ongoing"
+        print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))
+        break} else {
+          primary_analysis_inference = "Inconclusive"
+          which_threshold_passed = paste("neither ", Inference_threshold_BF_low, " or ", Inference_threshold_BF_high, sep = "")
+          print(paste("main analysis inference at latest stopping point =", primary_analysis_inference))}
+  
+}
+
+data_BF_true_nonerotic = data_BF
+last_row_true_nonerotic = last_row
+results_table_true_nonerotic = results_table
+primary_analysis_inference_true_nonerotic = primary_analysis_inference
+total_N_true_nonerotic = total_N
+successes_true_nonerotic = successes
+SE_in_probability_from_mixed_model_true_nonerotic = SE_in_probability_from_mixed_model
+CIlb_in_probability_from_mixed_model_true_nonerotic = wald_ci_mixed[1]
+CIub_in_probability_from_mixed_model_true_nonerotic = wald_ci_mixed[2]
+which_threshold_passed_true_nonerotic = which_threshold_passed
+BF_replication_true_nonerotic = BF_replication
+BF_uniform_true_nonerotic = BF_uniform
+BF_BUJ_true_nonerotic = BF_BUJ
+Inference_threshold_NHST_AMP1mixedrep_final_true_nonerotic = Inference_threshold_NHST_AMP1mixedrep/comparisons_Mixed_NHST
+estimate_true_nonerotic = logit2prob(estimate_mixed)
+
+
+##################################################################
+#       Visualize results of AMP-TPP 1 Confirmatory analysis     #
+##################################################################
+
+results_tables_AMP1 = rbind(results_table_pure_erotic,
+                            results_table_pure_nonerotic,
+                            results_table_sham_erotic,
+                            results_table_sham_nonerotic, 
+                            results_table_true_erotic,
+                            results_table_true_nonerotic)
+
+estimates_AMP1 = c(estimate_pure_erotic, estimate_pure_nonerotic, estimate_sham_erotic, estimate_sham_nonerotic, estimate_true_erotic, estimate_true_nonerotic)
+experimenttype_AMP1 = c("pure", "pure", "sham", "sham", "true", "true")
+trialtype_AMP1 =c("erotic", "nonerotic", "erotic", "nonerotic", "erotic", "nonerotic")
+experimenttype_trialtype_AMP1 = paste0(experimenttype_AMP1 ,"_", trialtype_AMP1)
+
+results_tables_complete_AMP1 = cbind(results_tables_AMP1, estimates_AMP1, experimenttype_AMP1, trialtype_AMP1, experimenttype_trialtype_AMP1)
+
+dodge <- position_dodge(width=0.2)
+results_tables_complete_AMP1 %>% 
+  ggplot()+
+  aes(y = estimates_AMP1, x = experimenttype_AMP1, color = trialtype_AMP1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_point(position = dodge, size = 3) +
+  geom_errorbar(aes(ymin = Mixed_mod_CIlb, ymax = Mixed_mod_CIub), width = 0.1, position = dodge, size = 1) +
+  ylim(c(0.54, 0.46))
+
+
+######################################################################
+#                                                                    #
+#                    AMP-TPP 2 replication analysis                  #
+#                                                                    #
+######################################################################
+
+
+##################################################################
+#                      Data management                           #
+##################################################################
+
+# only pure sessions are included to replicate AMP-TPP2
+data_nontest_AMP2rep = data_nontest[data_nontest$available_trial_type == 1,]
+
+# add a row_counter, which will be useful to distinguish data coming in after the stopping rule was met.
+data_nontest_AMP2rep[, "row_counter"] = 1:nrow(data_nontest_AMP2rep)
+
+data_nontest_AMP2rep_trials = data_nontest_AMP2rep[!is.na(data_nontest_AMP2rep[, "trial_number"]),]
+
+## extract data from erotic trials 
+data_nontest_AMP2rep_trials_erotic = data_nontest_AMP2rep_trials[data_nontest_AMP2rep_trials[, "reward_type"] == "erotic", ]
+
+# drop unused factor levels
+data_nontest_AMP2rep_trials_erotic[,"participant_ID"] = droplevels(data_nontest_AMP2rep_trials_erotic[,"participant_ID"])
+
+# drop data used in the AMP1purerep analysis, and also data above the maximum sample size
+data_nontest_AMP2rep_trials_erotic_maxtrialnum = data_nontest_AMP2rep_trials_erotic[(total_N_pure_erotic+1):(total_N_pure_erotic+max_num_trials_AMP2rep),]
+
+## extract data from non-erotic trials 
+data_nontest_AMP2rep_trials_nonerotic = data_nontest_AMP2rep_trials[data_nontest_AMP2rep_trials[, "reward_type"] == "neutral", ]
+
+# drop unused factor levels
+data_nontest_AMP2rep_trials_nonerotic[,"participant_ID"] = droplevels(data_nontest_AMP2rep_trials_nonerotic[,"participant_ID"])
+
+# drop data used in the AMP1purerep analysis, and also data above the maximum sample size
+data_nontest_AMP2rep_trials_nonerotic_maxtrialnum = data_nontest_AMP2rep_trials_nonerotic[(total_N_pure_nonerotic+1):(total_N_pure_nonerotic+max_num_trials_AMP2rep),]
+
+
+# cumulative sum of success sign
+
+data_nontest_AMP2rep_trials_erotic_maxtrialnum$sides_match_sign_cumsum = cumsum(data_nontest_AMP2rep_trials_erotic_maxtrialnum$sides_match_sign)
+data_nontest_AMP2rep_trials_nonerotic_maxtrialnum$sides_match_sign_cumsum = cumsum(data_nontest_AMP2rep_trials_nonerotic_maxtrialnum$sides_match_sign)
+
+
+##################################################################
+#                    Confirmatory analysis                       #
+##################################################################
+
+#### Hypothesis 1
+
+### Primary confirmatory analysis: mixed model binary logistic regression
+
+mod_mixed_H1_AMP2rep = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_nontest_AMP2rep_trials_erotic_maxtrialnum, family = "binomial")
+
+estimate_mixed_H1_AMP2rep = summary(mod_mixed_H1_AMP2rep)$coefficients[1,1]
+se_mixed_H1_AMP2rep = summary(mod_mixed_H1_AMP2rep)$coefficients[1,2]
+
+wald_ci_mixed_logit_H1_AMP2rep <- c(estimate_mixed_H1_AMP2rep - se_mixed_H1_AMP2rep* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)),
+                                    estimate_mixed_H1_AMP2rep + se_mixed_H1_AMP2rep* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)))
+wald_ci_mixed_H1_AMP2rep = logit2prob(wald_ci_mixed_logit_H1_AMP2rep)
+
+CI_lower_mixed_H1_AMP2rep = wald_ci_mixed_H1_AMP2rep[1]
+CI_upper_mixed_H1_AMP2rep = wald_ci_mixed_H1_AMP2rep[2]
+
+# results of the mixed model analysis
+CI_lower_mixed_H1_AMP2rep
+CI_upper_mixed_H1_AMP2rep
+
+
+# final statistical inference based on the mixed model
+if(CI_upper_mixed_H1_AMP2rep < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1_AMP2rep > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+conclusion
+
+### Robustness analysis using binomial test
+
+successes_H1_AMP2rep = sum(as.logical(data_nontest_AMP2rep_trials_erotic_maxtrialnum[,"sides_match"]))
+total_n_of_trials_H1_AMP2rep = nrow(data_nontest_AMP2rep_trials_erotic_maxtrialnum)
+
+
+CI_lower_binomtest_H1_AMP2rep = binom.test(x = successes_H1_AMP2rep, n = total_n_of_trials_H1_AMP2rep, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[1]
+CI_upper_binomtest_H1_AMP2rep = binom.test(x = successes_H1_AMP2rep, n = total_n_of_trials_H1_AMP2rep, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[2]
+
+## results of the binomial test
+CI_lower_binomtest_H1_AMP2rep
+CI_upper_binomtest_H1_AMP2rep
+
+
+
+#### Hypothesis 2
+
+### Primary confirmatory analysis: mixed model binary logistic regression
+
+mod_mixed_H2_AMP2rep = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_nontest_AMP2rep_trials_nonerotic_maxtrialnum, family = "binomial")
+
+estimate_mixed_H2_AMP2rep = summary(mod_mixed_H2_AMP2rep)$coefficients[1,1]
+se_mixed_H2_AMP2rep = summary(mod_mixed_H2_AMP2rep)$coefficients[1,2]
+
+wald_ci_mixed_logit_H2_AMP2rep <- c(estimate_mixed_H2_AMP2rep - se_mixed_H2_AMP2rep* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)),
+                                    estimate_mixed_H2_AMP2rep + se_mixed_H2_AMP2rep* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)))
+wald_ci_mixed_H2_AMP2rep = logit2prob(wald_ci_mixed_logit_H2_AMP2rep)
+
+CI_lower_mixed_H2_AMP2rep = wald_ci_mixed_H2_AMP2rep[1]
+CI_upper_mixed_H2_AMP2rep = wald_ci_mixed_H2_AMP2rep[2]
+
+# results of the mixed model analysis
+CI_lower_mixed_H2_AMP2rep
+CI_upper_mixed_H2_AMP2rep
+
+
+# final statistical inference based on the mixed model
+if(CI_upper_mixed_H2_AMP2rep < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H2_AMP2rep > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+conclusion
+
+### Robustness analysis using binomial test
+
+successes_H2_AMP2rep = sum(as.logical(data_nontest_AMP2rep_trials_nonerotic_maxtrialnum[,"sides_match"]))
+total_n_of_trials_H2_AMP2rep = nrow(data_nontest_AMP2rep_trials_nonerotic_maxtrialnum)
+
+
+CI_lower_binomtest_H2_AMP2rep = binom.test(x = successes_H2_AMP2rep, n = total_n_of_trials_H2_AMP2rep, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[1]
+CI_upper_binomtest_H2_AMP2rep = binom.test(x = successes_H2_AMP2rep, n = total_n_of_trials_H2_AMP2rep, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[2]
+
+## results of the binomial test
+CI_lower_binomtest_H2_AMP2rep
+CI_upper_binomtest_H2_AMP2rep
+
+
+##################################################################
+#       Visualize results of AMP-TPP 2 Confirmatory analysis     #
+##################################################################
+
+
+
+estimates_AMP2 = c(logit2prob(estimate_mixed_H1_AMP2rep), logit2prob(estimate_mixed_H2_AMP2rep))
+CIlb_AMP2 = c(CI_lower_mixed_H1_AMP2rep, CI_lower_mixed_H2_AMP2rep)
+CIub_AMP2 = c(CI_upper_mixed_H1_AMP2rep, CI_upper_mixed_H2_AMP2rep)
+trialtype_AMP2 = c("etoric", "nonerotic")
+
+results_tables_complete_AMP2 = data.frame(estimates_AMP2 = estimates_AMP2, CIlb_AMP2 = CIlb_AMP2, CIub_AMP2 = CIub_AMP2, trialtype_AMP2 = trialtype_AMP2)
+
+results_tables_complete_AMP2 %>% 
+  ggplot()+
+  aes(y = estimates_AMP2, x = trialtype_AMP2, color = trialtype_AMP2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = CIlb_AMP2, ymax = CIub_AMP2), width = 0.1, size = 1) +
+  ylim(c(0.54, 0.46))
+
+
+######################################################################
+#                                                                    #
+#       AMP-TPP1 replication analysis CI change over time plot       #
+#                                                                    #
+######################################################################
+
+### This computation can take a couple of hours.
+### To save processing time you can load the already processed data 
+### from here, and ignore the following lines until the ggplot:
+### wide_plot_data_AMP1rep <- read.csv(https://raw.githubusercontent.com/kekecsz/AMP-TPP3-materials/main/AMP3_AMP1rep_CIchange_plot_data.csv)
+
+trial_cap_AMP1rep = c(seq(100, total_N_pure_erotic, by = 100), total_N_pure_erotic)
+
+wide_plot_data_erotic_AMP1purerep = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+wide_plot_data_nonerotic_AMP1purerep = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+
+wide_plot_data_erotic_AMP1mixedrep_true = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+
+
+wide_plot_data_nonerotic_AMP1mixedrep_true = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+
+wide_plot_data_erotic_AMP1mixedrep_sham = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+
+
+wide_plot_data_nonerotic_AMP1mixedrep_sham = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+
+
+for(i in 1:length(trial_cap_AMP1rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP1rep[i]))
+  
+  data_segment = data_nontest_AMP1purerep_trials_erotic[1:trial_cap_AMP1rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1 = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment, family = "binomial")
+  
+  estimate_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,1]
+  se_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1 <- c(estimate_mixed_H1 - se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP1purerep_final_erotic)/2)),
+                              estimate_mixed_H1 + se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP1purerep_final_erotic)/2)))
+  wald_ci_mixed_H1 = logit2prob(wald_ci_mixed_logit_H1)
+  
+  CI_lower_mixed_H1 = wald_ci_mixed_H1[1]
+  CI_upper_mixed_H1 = wald_ci_mixed_H1[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_erotic_AMP1purerep[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1)
+  wide_plot_data_erotic_AMP1purerep[i, "CI_lb_mixmod"] = CI_lower_mixed_H1
+  wide_plot_data_erotic_AMP1purerep[i, "CI_ub_mixmod"] = CI_upper_mixed_H1
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1 < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1 > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1 = sum(as.logical(data_segment[,"sides_match"]))
+  total_n_of_trials_H1 = nrow(data_segment)
+  
+  
+  CI_lower_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1purerep_final_erotic))$conf.int[1]
+  CI_upper_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1purerep_final_erotic))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_erotic_AMP1purerep[i, "probability_of_success_binom"] = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1purerep_final_erotic))$estimate
+  wide_plot_data_erotic_AMP1purerep[i, "CI_lb_binom"] = CI_lower_binomtest_H1
+  wide_plot_data_erotic_AMP1purerep[i, "CI_ub_binom"] = CI_upper_binomtest_H1
+  
+  wide_plot_data_erotic_AMP1purerep[i, "trial_number"] = trial_cap_AMP1rep[i]
+}
+
+
+
+for(i in 1:length(trial_cap_AMP1rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP1rep[i]))
+  
+  data_segment = data_nontest_AMP1purerep_trials_nonerotic[1:trial_cap_AMP1rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1 = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment, family = "binomial")
+  
+  estimate_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,1]
+  se_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1 <- c(estimate_mixed_H1 - se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP1purerep_final_nonerotic)/2)),
+                              estimate_mixed_H1 + se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP1purerep_final_nonerotic)/2)))
+  wald_ci_mixed_H1 = logit2prob(wald_ci_mixed_logit_H1)
+  
+  CI_lower_mixed_H1 = wald_ci_mixed_H1[1]
+  CI_upper_mixed_H1 = wald_ci_mixed_H1[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_nonerotic_AMP1purerep[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1)
+  wide_plot_data_nonerotic_AMP1purerep[i, "CI_lb_mixmod"] = CI_lower_mixed_H1
+  wide_plot_data_nonerotic_AMP1purerep[i, "CI_ub_mixmod"] = CI_upper_mixed_H1
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1 < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1 > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1 = sum(as.logical(data_segment[,"sides_match"]))
+  total_n_of_trials_H1 = nrow(data_segment)
+  
+  
+  CI_lower_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1purerep_final_nonerotic))$conf.int[1]
+  CI_upper_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1purerep_final_nonerotic))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_nonerotic_AMP1purerep[i, "probability_of_success_binom"] = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1purerep_final_nonerotic))$estimate
+  wide_plot_data_nonerotic_AMP1purerep[i, "CI_lb_binom"] = CI_lower_binomtest_H1
+  wide_plot_data_nonerotic_AMP1purerep[i, "CI_ub_binom"] = CI_upper_binomtest_H1
+  
+  wide_plot_data_nonerotic_AMP1purerep[i, "trial_number"] = trial_cap_AMP1rep[i]
+}
+
+
+
+for(i in 1:length(trial_cap_AMP1rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP1rep[i]))
+  
+  data_segment_true = data_nontest_AMP1mixedrep_trials_erotic_true[1:trial_cap_AMP1rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1_true = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment_true, family = "binomial")
+  
+  estimate_mixed_H1_true = summary(mod_mixed_H1_true)$coefficients[1,1]
+  se_mixed_H1_true = summary(mod_mixed_H1_true)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1_true <- c(estimate_mixed_H1_true - se_mixed_H1_true* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_true_erotic)/2)),
+                                   estimate_mixed_H1_true + se_mixed_H1_true* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_true_erotic)/2)))
+  wald_ci_mixed_H1_true = logit2prob(wald_ci_mixed_logit_H1_true)
+  
+  CI_lower_mixed_H1_true = wald_ci_mixed_H1_true[1]
+  CI_upper_mixed_H1_true = wald_ci_mixed_H1_true[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_erotic_AMP1mixedrep_true[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1_true)
+  wide_plot_data_erotic_AMP1mixedrep_true[i, "CI_lb_mixmod"] = CI_lower_mixed_H1_true
+  wide_plot_data_erotic_AMP1mixedrep_true[i, "CI_ub_mixmod"] = CI_upper_mixed_H1_true
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1_true < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1_true > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1_true = sum(as.logical(data_segment_true[,"sides_match"]))
+  total_n_of_trials_H1_true = nrow(data_segment_true)
+  
+  
+  CI_lower_binomtest_H1_true = binom.test(x = successes_H1_true, n = total_n_of_trials_H1_true, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_true_erotic))$conf.int[1]
+  CI_upper_binomtest_H1_true = binom.test(x = successes_H1_true, n = total_n_of_trials_H1_true, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_true_erotic))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_erotic_AMP1mixedrep_true[i, "probability_of_success_binom"] = binom.test(x = successes_H1_true, n = total_n_of_trials_H1_true, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_true_erotic))$estimate
+  wide_plot_data_erotic_AMP1mixedrep_true[i, "CI_lb_binom"] = CI_lower_binomtest_H1_true
+  wide_plot_data_erotic_AMP1mixedrep_true[i, "CI_ub_binom"] = CI_upper_binomtest_H1_true
+  
+  wide_plot_data_erotic_AMP1mixedrep_true[i, "trial_number"] = trial_cap_AMP1rep[i]
+}
+
+
+for(i in 1:length(trial_cap_AMP1rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP1rep[i]))
+  
+  data_segment_true = data_nontest_AMP1mixedrep_trials_nonerotic_true[1:trial_cap_AMP1rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1_true = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment_true, family = "binomial")
+  
+  estimate_mixed_H1_true = summary(mod_mixed_H1_true)$coefficients[1,1]
+  se_mixed_H1_true = summary(mod_mixed_H1_true)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1_true <- c(estimate_mixed_H1_true - se_mixed_H1_true* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_true_nonerotic)/2)),
+                                   estimate_mixed_H1_true + se_mixed_H1_true* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_true_nonerotic)/2)))
+  wald_ci_mixed_H1_true = logit2prob(wald_ci_mixed_logit_H1_true)
+  
+  CI_lower_mixed_H1_true = wald_ci_mixed_H1_true[1]
+  CI_upper_mixed_H1_true = wald_ci_mixed_H1_true[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_nonerotic_AMP1mixedrep_true[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1_true)
+  wide_plot_data_nonerotic_AMP1mixedrep_true[i, "CI_lb_mixmod"] = CI_lower_mixed_H1_true
+  wide_plot_data_nonerotic_AMP1mixedrep_true[i, "CI_ub_mixmod"] = CI_upper_mixed_H1_true
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1_true < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1_true > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1_true = sum(as.logical(data_segment_true[,"sides_match"]))
+  total_n_of_trials_H1_true = nrow(data_segment_true)
+  
+  
+  CI_lower_binomtest_H1_true = binom.test(x = successes_H1_true, n = total_n_of_trials_H1_true, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_true_nonerotic))$conf.int[1]
+  CI_upper_binomtest_H1_true = binom.test(x = successes_H1_true, n = total_n_of_trials_H1_true, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_true_nonerotic))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_nonerotic_AMP1mixedrep_true[i, "probability_of_success_binom"] = binom.test(x = successes_H1_true, n = total_n_of_trials_H1_true, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_true_nonerotic))$estimate
+  wide_plot_data_nonerotic_AMP1mixedrep_true[i, "CI_lb_binom"] = CI_lower_binomtest_H1_true
+  wide_plot_data_nonerotic_AMP1mixedrep_true[i, "CI_ub_binom"] = CI_upper_binomtest_H1_true
+  
+  wide_plot_data_nonerotic_AMP1mixedrep_true[i, "trial_number"] = trial_cap_AMP1rep[i]
+}
+
+
+for(i in 1:length(trial_cap_AMP1rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP1rep[i]))
+  
+  data_segment_sham = data_nontest_AMP1mixedrep_trials_erotic_sham[1:trial_cap_AMP1rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1_sham = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment_sham, family = "binomial")
+  
+  estimate_mixed_H1_sham = summary(mod_mixed_H1_sham)$coefficients[1,1]
+  se_mixed_H1_sham = summary(mod_mixed_H1_sham)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1_sham <- c(estimate_mixed_H1_sham - se_mixed_H1_sham* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_sham_erotic)/2)),
+                                   estimate_mixed_H1_sham + se_mixed_H1_sham* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_sham_erotic)/2)))
+  wald_ci_mixed_H1_sham = logit2prob(wald_ci_mixed_logit_H1_sham)
+  
+  CI_lower_mixed_H1_sham = wald_ci_mixed_H1_sham[1]
+  CI_upper_mixed_H1_sham = wald_ci_mixed_H1_sham[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_erotic_AMP1mixedrep_sham[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1_sham)
+  wide_plot_data_erotic_AMP1mixedrep_sham[i, "CI_lb_mixmod"] = CI_lower_mixed_H1_sham
+  wide_plot_data_erotic_AMP1mixedrep_sham[i, "CI_ub_mixmod"] = CI_upper_mixed_H1_sham
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1_sham < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1_sham > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1_sham = sum(as.logical(data_segment_sham[,"sides_match"]))
+  total_n_of_trials_H1_sham = nrow(data_segment_sham)
+  
+  
+  CI_lower_binomtest_H1_sham = binom.test(x = successes_H1_sham, n = total_n_of_trials_H1_sham, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_sham_erotic))$conf.int[1]
+  CI_upper_binomtest_H1_sham = binom.test(x = successes_H1_sham, n = total_n_of_trials_H1_sham, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_sham_erotic))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_erotic_AMP1mixedrep_sham[i, "probability_of_success_binom"] = binom.test(x = successes_H1_sham, n = total_n_of_trials_H1_sham, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_sham_erotic))$estimate
+  wide_plot_data_erotic_AMP1mixedrep_sham[i, "CI_lb_binom"] = CI_lower_binomtest_H1_sham
+  wide_plot_data_erotic_AMP1mixedrep_sham[i, "CI_ub_binom"] = CI_upper_binomtest_H1_sham
+  
+  wide_plot_data_erotic_AMP1mixedrep_sham[i, "trial_number"] = trial_cap_AMP1rep[i]
+}
+
+
+for(i in 1:length(trial_cap_AMP1rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP1rep[i]))
+  
+  data_segment_sham = data_nontest_AMP1mixedrep_trials_nonerotic_sham[1:trial_cap_AMP1rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1_sham = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment_sham, family = "binomial")
+  
+  estimate_mixed_H1_sham = summary(mod_mixed_H1_sham)$coefficients[1,1]
+  se_mixed_H1_sham = summary(mod_mixed_H1_sham)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1_sham <- c(estimate_mixed_H1_sham - se_mixed_H1_sham* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_sham_nonerotic)/2)),
+                                   estimate_mixed_H1_sham + se_mixed_H1_sham* qnorm(1-((Inference_threshold_NHST_AMP1mixedrep_final_sham_nonerotic)/2)))
+  wald_ci_mixed_H1_sham = logit2prob(wald_ci_mixed_logit_H1_sham)
+  
+  CI_lower_mixed_H1_sham = wald_ci_mixed_H1_sham[1]
+  CI_upper_mixed_H1_sham = wald_ci_mixed_H1_sham[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_nonerotic_AMP1mixedrep_sham[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1_sham)
+  wide_plot_data_nonerotic_AMP1mixedrep_sham[i, "CI_lb_mixmod"] = CI_lower_mixed_H1_sham
+  wide_plot_data_nonerotic_AMP1mixedrep_sham[i, "CI_ub_mixmod"] = CI_upper_mixed_H1_sham
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1_sham < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1_sham > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1_sham = sum(as.logical(data_segment_sham[,"sides_match"]))
+  total_n_of_trials_H1_sham = nrow(data_segment_sham)
+  
+  
+  CI_lower_binomtest_H1_sham = binom.test(x = successes_H1_sham, n = total_n_of_trials_H1_sham, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_sham_nonerotic))$conf.int[1]
+  CI_upper_binomtest_H1_sham = binom.test(x = successes_H1_sham, n = total_n_of_trials_H1_sham, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_sham_nonerotic))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_nonerotic_AMP1mixedrep_sham[i, "probability_of_success_binom"] = binom.test(x = successes_H1_sham, n = total_n_of_trials_H1_sham, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP1mixedrep_final_sham_nonerotic))$estimate
+  wide_plot_data_nonerotic_AMP1mixedrep_sham[i, "CI_lb_binom"] = CI_lower_binomtest_H1_sham
+  wide_plot_data_nonerotic_AMP1mixedrep_sham[i, "CI_ub_binom"] = CI_upper_binomtest_H1_sham
+  
+  wide_plot_data_nonerotic_AMP1mixedrep_sham[i, "trial_number"] = trial_cap_AMP1rep[i]
+}
+
+
+wide_plot_data_AMP1purerep = rbind(wide_plot_data_erotic_AMP1purerep, wide_plot_data_nonerotic_AMP1purerep)
+wide_plot_data_AMP1purerep$reward_type = c(rep("erotic", nrow(wide_plot_data_erotic_AMP1purerep)), rep("nonerotic", nrow(wide_plot_data_nonerotic_AMP1purerep)))
+
+wide_plot_data_AMP1mixedrep_true = rbind(wide_plot_data_erotic_AMP1mixedrep_true, wide_plot_data_nonerotic_AMP1mixedrep_true)
+wide_plot_data_AMP1mixedrep_true$reward_type = c(rep("erotic", nrow(wide_plot_data_erotic_AMP1mixedrep_true)), rep("nonerotic", nrow(wide_plot_data_nonerotic_AMP1mixedrep_true)))
+
+wide_plot_data_AMP1mixedrep_sham = rbind(wide_plot_data_erotic_AMP1mixedrep_sham, wide_plot_data_nonerotic_AMP1mixedrep_sham)
+wide_plot_data_AMP1mixedrep_sham$reward_type = c(rep("erotic", nrow(wide_plot_data_erotic_AMP1mixedrep_sham)), rep("nonerotic", nrow(wide_plot_data_nonerotic_AMP1mixedrep_sham)))
+
+wide_plot_data_AMP1rep = rbind(wide_plot_data_AMP1purerep, wide_plot_data_AMP1mixedrep_true, wide_plot_data_AMP1mixedrep_sham)
+wide_plot_data_AMP1rep$trial_type = c(rep("pure", nrow(wide_plot_data_AMP1purerep)), rep("true", nrow(wide_plot_data_AMP1mixedrep_true)), rep("sham", nrow(wide_plot_data_AMP1mixedrep_sham)))
+
+
+
+wide_plot_data_AMP1rep %>% 
+  ggplot() +
+  aes(x = trial_number, y = probability_of_success_mixmod, fill = reward_type) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_ribbon(aes(ymin = CI_lb_mixmod, ymax = CI_ub_mixmod), alpha = 0.5) +
+  scale_x_continuous(expand = c(0, 0)) +
+  facet_grid(trial_type ~ .)
+
+
+wide_plot_AMP1rep = wide_plot_data_AMP1rep %>% 
+  ggplot() +
+  aes(x = trial_number, y = probability_of_success_mixmod) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_ribbon(aes(ymin = CI_lb_mixmod, ymax = CI_ub_mixmod), alpha = 0.5) +
+  scale_x_continuous(expand = c(0, 0)) +
+  facet_grid(trial_type ~ reward_type)
+wide_plot_AMP1rep
+
+
+### For saving high-res plot 
+# tiff("C:\\Users\\User\\Documents\\CIchange_plot_AMP1rep.tiff", units="in", width=15, height=10, res=200)
+# wide_plot_AMP1rep
+# dev.off()
+
+
+
+
+######################################################################
+#                                                                    #
+#       AMP-TPP1 replication analysis cumulative sum of sign plot    #
+#                                                                    #
+######################################################################
+
+
+
+
+
+cumulative_sums_AMP1rep = c(
+  data_BF_pure_erotic$sides_match_sign_cumsum,
+  data_BF_pure_nonerotic$sides_match_sign_cumsum,
+  data_BF_true_erotic$sides_match_sign_cumsum,
+  data_BF_true_nonerotic$sides_match_sign_cumsum,
+  data_BF_sham_erotic$sides_match_sign_cumsum,
+  data_BF_sham_nonerotic$sides_match_sign_cumsum
+)
+
+cumulative_sums_origin_AMP1rep = c(rep("pure_erotic", length(data_BF_pure_erotic$sides_match_sign_cumsum)),
+                                   rep("pure_nonerotic", length(data_BF_pure_nonerotic$sides_match_sign_cumsum)),
+                                   rep("true_erotic", length(data_BF_true_erotic$sides_match_sign_cumsum)),
+                                   rep("true_nonerotic", length(data_BF_true_nonerotic$sides_match_sign_cumsum)),
+                                   rep("sham_erotic", length(data_BF_sham_erotic$sides_match_sign_cumsum)),
+                                   rep("sham_nonerotic", length(data_BF_sham_nonerotic$sides_match_sign_cumsum)))
+
+trial_number_AMP1rep = c(1:length(data_BF_pure_erotic$sides_match_sign_cumsum),
+                         1:length(data_BF_pure_nonerotic$sides_match_sign_cumsum),
+                         1:length(data_BF_true_erotic$sides_match_sign_cumsum),
+                         1:length(data_BF_true_nonerotic$sides_match_sign_cumsum),
+                         1:length(data_BF_sham_erotic$sides_match_sign_cumsum),
+                         1:length(data_BF_sham_nonerotic$sides_match_sign_cumsum))
+
+
+
+cumulative_sums_dataframe_AMP1rep = data.frame(cumulative_sums = cumulative_sums_AMP1rep, trial_number = trial_number_AMP1rep, origin = cumulative_sums_origin_AMP1rep)
+
+cumulative_sums_dataframe_AMP1rep %>% 
+  ggplot() +
+  aes(y = cumulative_sums, x = trial_number, color = origin) +
+  geom_line()
+
+
+
+
+
+######################################################################
+#                                                                    #
+#       AMP-TPP2 replication analysis CI change over time plot       #
+#                                                                    #
+######################################################################
+
+### This computation can take a couple of hours.
+### To save processing time you can load the already processed data 
+### from here, and ignore the following lines until the ggplot:
+### wide_plot_data_AMP2rep <- read.csv(https://raw.githubusercontent.com/kekecsz/AMP-TPP3-materials/main/AMP3_AMP2rep_CIchange_plot_data.csv)
+
+
+trial_cap_AMP2rep = c(seq(100, max_num_trials_AMP2rep, by = 100), max_num_trials_AMP2rep)
+
+wide_plot_data_erotic_AMP2rep = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+
+
+wide_plot_data_nonerotic_AMP2rep = data.frame(
+  probability_of_success_mixmod = NA,
+  CI_lb_mixmod = NA,
+  CI_ub_mixmod = NA,
+  probability_of_success_binom = NA,
+  CI_lb_binom = NA,
+  CI_ub_binom = NA,
+  trial_number = NA)
+
+
+
+for(i in 1:length(trial_cap_AMP2rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP2rep[i]))
+  
+  data_segment = data_nontest_AMP2rep_trials_erotic_maxtrialnum[1:trial_cap_AMP2rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1 = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment, family = "binomial")
+  
+  estimate_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,1]
+  se_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1 <- c(estimate_mixed_H1 - se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)),
+                              estimate_mixed_H1 + se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)))
+  wald_ci_mixed_H1 = logit2prob(wald_ci_mixed_logit_H1)
+  
+  CI_lower_mixed_H1 = wald_ci_mixed_H1[1]
+  CI_upper_mixed_H1 = wald_ci_mixed_H1[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_erotic_AMP2rep[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1)
+  wide_plot_data_erotic_AMP2rep[i, "CI_lb_mixmod"] = CI_lower_mixed_H1
+  wide_plot_data_erotic_AMP2rep[i, "CI_ub_mixmod"] = CI_upper_mixed_H1
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1 < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1 > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1 = sum(as.logical(data_segment[,"sides_match"]))
+  total_n_of_trials_H1 = nrow(data_segment)
+  
+  
+  CI_lower_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[1]
+  CI_upper_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_erotic_AMP2rep[i, "probability_of_success_binom"] = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$estimate
+  wide_plot_data_erotic_AMP2rep[i, "CI_lb_binom"] = CI_lower_binomtest_H1
+  wide_plot_data_erotic_AMP2rep[i, "CI_ub_binom"] = CI_upper_binomtest_H1
+  
+  wide_plot_data_erotic_AMP2rep[i, "trial_number"] = trial_cap_AMP2rep[i]
+}
+
+
+
+
+for(i in 1:length(trial_cap_AMP2rep)){
+  
+  print(paste0("computing for trial = ", trial_cap_AMP2rep[i]))
+  
+  data_segment = data_nontest_AMP2rep_trials_nonerotic_maxtrialnum[1:trial_cap_AMP2rep[i],]
+  
+  ### Primary confirmatory analysis: mixed model binary logistic regression
+  
+  mod_mixed_H1 = glmer(sides_match_numeric ~ 1 + (1|participant_ID), data = data_segment, family = "binomial")
+  
+  estimate_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,1]
+  se_mixed_H1 = summary(mod_mixed_H1)$coefficients[1,2]
+  
+  wald_ci_mixed_logit_H1 <- c(estimate_mixed_H1 - se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)),
+                              estimate_mixed_H1 + se_mixed_H1* qnorm(1-((Inference_threshold_NHST_AMP2rep)/2)))
+  wald_ci_mixed_H1 = logit2prob(wald_ci_mixed_logit_H1)
+  
+  CI_lower_mixed_H1 = wald_ci_mixed_H1[1]
+  CI_upper_mixed_H1 = wald_ci_mixed_H1[2]
+  
+  # results of the mixed model analysis
+  wide_plot_data_nonerotic_AMP2rep[i, "probability_of_success_mixmod"] = logit2prob(estimate_mixed_H1)
+  wide_plot_data_nonerotic_AMP2rep[i, "CI_lb_mixmod"] = CI_lower_mixed_H1
+  wide_plot_data_nonerotic_AMP2rep[i, "CI_ub_mixmod"] = CI_upper_mixed_H1
+  
+  
+  
+  # final statistical inference based on the mixed model
+  if(CI_upper_mixed_H1 < M0_prob){conclusion = "M1"} else if(CI_lower_mixed_H1 > M0_prob){conclusion = "M1"} else {conclusion = "Inconclusive"}
+  conclusion
+  
+  ### Robustness analysis using binomial test
+  
+  successes_H1 = sum(as.logical(data_segment[,"sides_match"]))
+  total_n_of_trials_H1 = nrow(data_segment)
+  
+  
+  CI_lower_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[1]
+  CI_upper_binomtest_H1 = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$conf.int[2]
+  
+  ## results of the binomial test
+  
+  wide_plot_data_nonerotic_AMP2rep[i, "probability_of_success_binom"] = binom.test(x = successes_H1, n = total_n_of_trials_H1, p = 0.5, conf.level = (1-Inference_threshold_NHST_AMP2rep))$estimate
+  wide_plot_data_nonerotic_AMP2rep[i, "CI_lb_binom"] = CI_lower_binomtest_H1
+  wide_plot_data_nonerotic_AMP2rep[i, "CI_ub_binom"] = CI_upper_binomtest_H1
+  
+  wide_plot_data_nonerotic_AMP2rep[i, "trial_number"] = trial_cap_AMP2rep[i]
+}
+
+
+wide_plot_data_AMP2rep = rbind(wide_plot_data_erotic_AMP2rep, wide_plot_data_nonerotic_AMP2rep)
+wide_plot_data_AMP2rep$reward_type = c(rep("erotic", nrow(wide_plot_data_erotic_AMP2rep)), rep("nonerotic", nrow(wide_plot_data_nonerotic_AMP2rep)))
+
+
+wide_plot_data_AMP2rep %>% 
+  ggplot() +
+  aes(x = trial_number, y = probability_of_success_mixmod, fill = reward_type) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_ribbon(aes(ymin = CI_lb_mixmod, ymax = CI_ub_mixmod), alpha = 0.5) +
+  scale_x_continuous(expand = c(0, 0))
+
+wide_plot_AMP2rep = wide_plot_data_AMP2rep %>% 
+  ggplot() +
+  aes(x = trial_number, y = probability_of_success_mixmod) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_ribbon(aes(ymin = CI_lb_mixmod, ymax = CI_ub_mixmod), alpha = 0.5) +
+  scale_x_continuous(expand = c(0, 0)) +
+  ylim(c(0.4, 0.6)) +
+  facet_grid(reward_type~.)
+wide_plot_AMP2rep
+
+### For saving high-res plot 
+### tiff("C:\\Users\\User\\Documents\\CIchange_plot_AMP2rep.tiff", units="in", width=10, height=5, res=200)
+### wide_plot_AMP2rep
+### dev.off()
+
+
+######################################################################
+#                                                                    #
+#       AMP-TPP2 replication analysis cumulative sum of sign plot    #
+#                                                                    #
+######################################################################
+
+
+
+cumulative_sums_AMP2rep = c(
+  data_nontest_AMP2rep_trials_erotic_maxtrialnum$sides_match_sign_cumsum,
+  data_nontest_AMP2rep_trials_nonerotic_maxtrialnum$sides_match_sign_cumsum
+)
+
+cumulative_sums_origin_AMP2rep = c(rep("erotic", length(data_nontest_AMP2rep_trials_erotic_maxtrialnum$sides_match_sign_cumsum)),
+                                   rep("nonerotic", length(data_nontest_AMP2rep_trials_nonerotic_maxtrialnum$sides_match_sign_cumsum)))
+
+trial_number_AMP2rep = c(1:length(data_nontest_AMP2rep_trials_erotic_maxtrialnum$sides_match_sign_cumsum), 
+                         1:length(data_nontest_AMP2rep_trials_nonerotic_maxtrialnum$sides_match_sign_cumsum))
+
+
+
+cumulative_sums_dataframe_AMP2rep = data.frame(cumulative_sums = cumulative_sums_AMP2rep, trial_number = trial_number_AMP2rep, origin = cumulative_sums_origin_AMP2rep)
+
+cumulative_sums_dataframe_AMP2rep %>% 
+  ggplot() +
+  aes(y = cumulative_sums, x = trial_number, color = origin) +
+  geom_line()
+
+
+
+######################################################################
+#                                                                    #
+#                    Side-balance analysis                           #
+#                                                                    #
+######################################################################
+
+
+
+############# AMP-TPP1 replication analysis - guessed side
+
+balance_analysis_table_guessed_side_AMP1 = as.data.frame(matrix(data = NA, nrow = 6, ncol = 7))
+names(balance_analysis_table_guessed_side_AMP1) = c("N_side_left", "proportion_side_left", "CIlb_side_left", "CIub_side_left", "reward_type", "origin", "origin_reward_type")
+balance_analysis_table_guessed_side_AMP1[,"reward_type"] = rep(c("erotic", "nonerotic"), 3)
+balance_analysis_table_guessed_side_AMP1[,"origin"] = rep(c("pure", "true", "sham"), each = 2)
+balance_analysis_table_guessed_side_AMP1[,"origin_reward_type"] = paste(balance_analysis_table_guessed_side_AMP1[,"origin"], balance_analysis_table_guessed_side_AMP1[,"reward_type"], sep = "_")
+
+data_for_balance_analysis_list_AMP1_guessed = list(data_BF_pure_erotic, data_BF_pure_nonerotic, data_BF_true_erotic, data_BF_true_nonerotic, data_BF_sham_erotic, data_BF_sham_nonerotic)
+
+for(i in 1:length(data_for_balance_analysis_list_AMP1_guessed)){
+  data_for_balance_analysis = data_for_balance_analysis_list_AMP1_guessed[[i]]
+  
+  balance_analysis_table_guessed_side_AMP1[i, "N_side_left"] = sum(data_for_balance_analysis[,"guessed_side"] == "left")
+  balance_analysis_table_guessed_side_AMP1[i, "proportion_side_left"] = balance_analysis_table_guessed_side_AMP1[i, "N_side_left"]/length(data_for_balance_analysis[,"guessed_side"] == "left" | data_for_balance_analysis[,"guessed_side"] == "right")
+  balance_analysis_table_guessed_side_AMP1[i, "CIlb_side_left"] = binom.test(x = balance_analysis_table_guessed_side_AMP1[i, "N_side_left"], n = length(data_for_balance_analysis[,"guessed_side"]))$conf.int[1]
+  balance_analysis_table_guessed_side_AMP1[i, "CIub_side_left"] = binom.test(x = balance_analysis_table_guessed_side_AMP1[i, "N_side_left"], n = length(data_for_balance_analysis[,"guessed_side"]))$conf.int[2]
+  
+}
+
+
+
+############# AMP-TPP1 replication analysis - target side
+
+balance_analysis_table_target_side_AMP1 = as.data.frame(matrix(data = NA, nrow = 6, ncol = 7))
+names(balance_analysis_table_target_side_AMP1) = c("N_side_left", "proportion_side_left", "CIlb_side_left", "CIub_side_left", "reward_type", "origin", "origin_reward_type")
+balance_analysis_table_target_side_AMP1[,"reward_type"] = rep(c("erotic", "nonerotic"), 3)
+balance_analysis_table_target_side_AMP1[,"origin"] = rep(c("pure", "true", "sham"), each = 2)
+balance_analysis_table_target_side_AMP1[,"origin_reward_type"] = paste(balance_analysis_table_target_side_AMP1[,"origin"], balance_analysis_table_target_side_AMP1[,"reward_type"], sep = "_")
+
+data_for_balance_analysis_list_AMP1_target = list(data_BF_pure_erotic, data_BF_pure_nonerotic, data_BF_true_erotic, data_BF_true_nonerotic, data_BF_sham_erotic, data_BF_sham_nonerotic)
+
+for(i in 1:length(data_for_balance_analysis_list_AMP1_target)){
+  data_for_balance_analysis = data_for_balance_analysis_list_AMP1_target[[i]]
+  
+  balance_analysis_table_target_side_AMP1[i, "N_side_left"] = sum(data_for_balance_analysis[,"target_side"] == "left")
+  balance_analysis_table_target_side_AMP1[i, "proportion_side_left"] = balance_analysis_table_target_side_AMP1[i, "N_side_left"]/length(data_for_balance_analysis[,"target_side"] == "left" | data_for_balance_analysis[,"target_side"] == "right")
+  balance_analysis_table_target_side_AMP1[i, "CIlb_side_left"] = binom.test(x = balance_analysis_table_target_side_AMP1[i, "N_side_left"], n = length(data_for_balance_analysis[,"target_side"]))$conf.int[1]
+  balance_analysis_table_target_side_AMP1[i, "CIub_side_left"] = binom.test(x = balance_analysis_table_target_side_AMP1[i, "N_side_left"], n = length(data_for_balance_analysis[,"target_side"]))$conf.int[2]
+  
+}
+
+
+############# AMP-TPP1 replication analysis - balance analysis plot
+
+balance_analysis_table_AMP1 = rbind(balance_analysis_table_guessed_side_AMP1, balance_analysis_table_target_side_AMP1)
+balance_analysis_table_AMP1$guessed_or_target = rep(c("guessed", "target"), each = 6)
+
+
+
+
+dodge <- position_dodge(width=0.2)
+
+balance_analysis_table_AMP1 %>% 
+  ggplot() + 
+  aes(x = origin_reward_type, y = proportion_side_left, color = guessed_or_target) +
+  geom_point(position = dodge) +
+  geom_errorbar(aes(ymin = CIlb_side_left, ymax = CIub_side_left), width = 0.1, position = dodge) +
+  geom_hline(yintercept = 0.5, lty = "dashed") +
+  ylim(c(0.46, 0.54))
+
+
+
+############# AMP-TPP2 replication analysis - guessed side
+
+balance_analysis_table_guessed_side_AMP2 = as.data.frame(matrix(data = NA, nrow = 2, ncol = 5))
+names(balance_analysis_table_guessed_side_AMP2) = c("N_side_left", "proportion_side_left", "CIlb_side_left", "CIub_side_left", "reward_type")
+balance_analysis_table_guessed_side_AMP2[,"reward_type"] = c("erotic", "nonerotic")
+
+data_for_balance_analysis_list_AMP2_guessed = list(data_nontest_AMP2rep_trials_erotic_maxtrialnum, data_nontest_AMP2rep_trials_nonerotic_maxtrialnum)
+
+for(i in 1:length(data_for_balance_analysis_list_AMP2_guessed)){
+  data_for_balance_analysis = data_for_balance_analysis_list_AMP2_guessed[[i]]
+  
+  balance_analysis_table_guessed_side_AMP2[i, "N_side_left"] = sum(data_for_balance_analysis[,"guessed_side"] == "left")
+  balance_analysis_table_guessed_side_AMP2[i, "proportion_side_left"] = balance_analysis_table_guessed_side_AMP2[i, "N_side_left"]/length(data_for_balance_analysis[,"guessed_side"] == "left" | data_for_balance_analysis[,"guessed_side"] == "right")
+  balance_analysis_table_guessed_side_AMP2[i, "CIlb_side_left"] = binom.test(x = balance_analysis_table_guessed_side_AMP2[i, "N_side_left"], n = length(data_for_balance_analysis[,"guessed_side"]))$conf.int[1]
+  balance_analysis_table_guessed_side_AMP2[i, "CIub_side_left"] = binom.test(x = balance_analysis_table_guessed_side_AMP2[i, "N_side_left"], n = length(data_for_balance_analysis[,"guessed_side"]))$conf.int[2]
+  
+}
+
+############# AMP-TPP2 replication analysis - target side
+
+balance_analysis_table_target_side_AMP2 = as.data.frame(matrix(data = NA, nrow = 2, ncol = 5))
+names(balance_analysis_table_target_side_AMP2) = c("N_side_left", "proportion_side_left", "CIlb_side_left", "CIub_side_left", "reward_type")
+balance_analysis_table_target_side_AMP2[,"reward_type"] = c("erotic", "nonerotic")
+
+data_for_balance_analysis_list_AMP2_target = list(data_nontest_AMP2rep_trials_erotic_maxtrialnum, data_nontest_AMP2rep_trials_nonerotic_maxtrialnum)
+
+for(i in 1:length(data_for_balance_analysis_list_AMP2_target)){
+  data_for_balance_analysis = data_for_balance_analysis_list_AMP2_target[[i]]
+  
+  balance_analysis_table_target_side_AMP2[i, "N_side_left"] = sum(data_for_balance_analysis[,"target_side"] == "left")
+  balance_analysis_table_target_side_AMP2[i, "proportion_side_left"] = balance_analysis_table_target_side_AMP2[i, "N_side_left"]/length(data_for_balance_analysis[,"target_side"] == "left" | data_for_balance_analysis[,"target_side"] == "right")
+  balance_analysis_table_target_side_AMP2[i, "CIlb_side_left"] = binom.test(x = balance_analysis_table_target_side_AMP2[i, "N_side_left"], n = length(data_for_balance_analysis[,"target_side"]))$conf.int[1]
+  balance_analysis_table_target_side_AMP2[i, "CIub_side_left"] = binom.test(x = balance_analysis_table_target_side_AMP2[i, "N_side_left"], n = length(data_for_balance_analysis[,"target_side"]))$conf.int[2]
+  
+}
+
+############# AMP-TPP2 replication analysis - balance analysis plot
+
+balance_analysis_table_AMP2 = rbind(balance_analysis_table_guessed_side_AMP2, balance_analysis_table_target_side_AMP2)
+balance_analysis_table_AMP2$guessed_or_target = rep(c("guessed", "target"), each = 2)
+
+
+
+
+dodge <- position_dodge(width=0.2)
+
+balance_analysis_table_AMP2 %>% 
+  ggplot() + 
+  aes(x = reward_type, y = proportion_side_left, color = guessed_or_target) +
+  geom_point(position = dodge) +
+  geom_errorbar(aes(ymin = CIlb_side_left, ymax = CIub_side_left), width = 0.1, position = dodge) +
+  geom_hline(yintercept = 0.5, lty = "dashed") +
+  ylim(c(0.46, 0.54))
+
